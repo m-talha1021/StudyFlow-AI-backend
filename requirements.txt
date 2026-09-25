@@ -8,3 +8,5 @@ pypdf
 python-docx
 python-pptx
 langdetect
+arabic-reshaper
+python-bidi
