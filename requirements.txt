@@ -3,8 +3,7 @@ flask-cors
 python-dotenv
 google-genai
 numpy
-scikit-learn
-PyPDF2
+reportlab
+pypdf
 python-docx
 python-pptx
-reportlab
