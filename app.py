@@ -68,14 +68,13 @@ CORS(
     resources={
         r"/api/*": {
             "origins": [
-                "http://localhost:5173",
-                "http://localhost:3000",
-                "https://study-flow-assistant.netlify.app"
-            ],
-            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization"]
+                "https://study-flow-assistant.netlify.app",
+                "http://localhost:5173"
+            ]
         }
-    }
+    },
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"]
 )
 
 
