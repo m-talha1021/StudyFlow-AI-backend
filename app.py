@@ -68,6 +68,7 @@ CORS(
     resources={
         r"/api/*": {
             "origins": [
+                "https://study-flow-ai-lac.vercel.app",
                 "https://study-flow-assistant.netlify.app",
                 "http://localhost:5173"
             ]
