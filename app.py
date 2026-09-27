@@ -63,18 +63,48 @@ GEMINI_MODELS = [
 
 app = Flask(__name__)
 
+# ============================================================
+# CORS / FRONTEND ACCESS
+# ============================================================
+FRONTEND_ORIGINS = {
+    "https://study-flow-ai-lac.vercel.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+}
+
 CORS(
     app,
     resources={
         r"/api/*": {
-            "origins": [
-                "https://study-flow-ai-lac.vercel.app"
-            ]
+            "origins": list(FRONTEND_ORIGINS),
+            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+            "expose_headers": ["Content-Disposition"],
+            "max_age": 86400,
         }
     },
-    methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"]
+    supports_credentials=False,
 )
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = jsonify({"success": True})
+        response.status_code = 204
+        return response
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin")
+    if origin in FRONTEND_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Expose-Headers"] = "Content-Disposition"
+        response.headers["Vary"] = "Origin"
+    return response
 
 
 # ============================================================
@@ -133,8 +163,7 @@ def count_script_characters(text):
 
     arabic_count = len(
         re.findall(
-            r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF"
-            r"\uFB50-\uFDFF\uFE70-\uFEFF]",
+            r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]",
             text
         )
     )
@@ -152,21 +181,16 @@ def count_script_characters(text):
 def normalize_detected_language(language, text):
     """
     Make language detection more reliable.
+
+    This gives Arabic its own language category instead
+    of allowing it to fall into the English/default case.
     """
 
-    detected = (
-        language or ""
-    ).lower().strip()
+    detected = (language or "").lower().strip()
 
-    arabic_count, latin_count = (
-        count_script_characters(text)
-    )
+    arabic_count, latin_count = count_script_characters(text)
 
-    total_script = (
-        arabic_count +
-        latin_count
-    )
-
+    total_script = arabic_count + latin_count
 
     # --------------------------------------------------------
     # Strong Arabic-script material
@@ -174,11 +198,10 @@ def normalize_detected_language(language, text):
 
     if total_script > 0:
 
-        arabic_ratio = (
-            arabic_count /
-            total_script
-        )
+        arabic_ratio = arabic_count / total_script
 
+        # If the material is overwhelmingly Arabic script,
+        # determine whether it is Urdu or Arabic.
         if arabic_ratio >= 0.85:
 
             # Urdu-specific characters
@@ -189,14 +212,17 @@ def normalize_detected_language(language, text):
                 )
             )
 
+            # If Urdu-specific characters are present,
+            # treat the material as Urdu.
             if urdu_specific >= 2:
                 return "urdu"
 
+            # Otherwise treat it as Arabic.
             return "arabic"
 
-
     # --------------------------------------------------------
-    # Respect existing detector
+    # Respect existing detector when it already identifies
+    # a known language.
     # --------------------------------------------------------
 
     if detected in {
@@ -205,9 +231,7 @@ def normalize_detected_language(language, text):
         "english",
         "mixed"
     }:
-
         return detected
-
 
     # --------------------------------------------------------
     # Fallback
@@ -229,16 +253,14 @@ def normalize_detected_language(language, text):
 def clean_generated_result(text):
 
     """
-    Remove Markdown formatting while preserving
-    Arabic and Urdu Unicode characters.
+    Remove Markdown formatting from Gemini's response
+    while preserving Arabic and Urdu Unicode characters.
     """
 
     if not text:
         return ""
 
-
-    # Bold
-
+    # Remove bold
     text = re.sub(
         r"\*\*(.*?)\*\*",
         r"\1",
@@ -246,18 +268,14 @@ def clean_generated_result(text):
         flags=re.DOTALL
     )
 
-
-    # Italic
-
+    # Remove italic
     text = re.sub(
-        r"(?<!\*)(\*)(?!\s)(.*?)(?<!\s)\*(?!\*)",
-        r"\2",
+        r"(?<!\*)\*(?!\s)(.*?)(?<!\s)\*(?!\*)",
+        r"\1",
         text
     )
 
-
-    # Underscore bold
-
+    # Remove underscore bold
     text = re.sub(
         r"__(.*?)__",
         r"\1",
@@ -265,9 +283,7 @@ def clean_generated_result(text):
         flags=re.DOTALL
     )
 
-
-    # Headings
-
+    # Remove headings
     text = re.sub(
         r"^\s*#{1,6}\s*",
         "",
@@ -275,9 +291,7 @@ def clean_generated_result(text):
         flags=re.MULTILINE
     )
 
-
-    # Bullet points
-
+    # Convert bullet points
     text = re.sub(
         r"^\s*\*\s+",
         "• ",
@@ -292,9 +306,7 @@ def clean_generated_result(text):
         flags=re.MULTILINE
     )
 
-
-    # Numbered lists
-
+    # Clean numbered lists
     text = re.sub(
         r"^\s*(\d+)\.\s+",
         r"\1. ",
@@ -302,17 +314,10 @@ def clean_generated_result(text):
         flags=re.MULTILINE
     )
 
+    # Remove inline code markers
+    text = text.replace("`", "")
 
-    # Inline code
-
-    text = text.replace(
-        "`",
-        ""
-    )
-
-
-    # Horizontal lines
-
+    # Remove horizontal lines
     text = re.sub(
         r"^\s*([-*_]){3,}\s*$",
         "",
@@ -320,24 +325,19 @@ def clean_generated_result(text):
         flags=re.MULTILINE
     )
 
-
-    # Trailing spaces
-
+    # Remove trailing spaces
     text = re.sub(
         r"[ \t]+\n",
         "\n",
         text
     )
 
-
-    # Excessive blank lines
-
+    # Prevent excessive blank lines
     text = re.sub(
         r"\n{3,}",
         "\n\n",
         text
     )
-
 
     return text.strip()
 
@@ -360,7 +360,7 @@ def home():
 # API TEST
 # ============================================================
 
-@app.route("/api/test")
+@app.route("/api/test", methods=["GET", "OPTIONS"], strict_slashes=False)
 def test_api():
 
     return jsonify({
@@ -376,7 +376,8 @@ def test_api():
 
 @app.route(
     "/api/material",
-    methods=["POST"]
+    methods=["POST"],
+    strict_slashes=False
 )
 def process_material():
 
@@ -398,13 +399,11 @@ def process_material():
             file = request.files["file"]
 
             if file.filename == "":
-
                 return jsonify({
                     "success": False,
                     "error":
                         "No file was selected."
                 }), 400
-
 
             filename = file.filename
 
@@ -412,7 +411,6 @@ def process_material():
                 ".",
                 1
             )[-1].lower()
-
 
             if extension not in ALLOWED_EXTENSIONS:
 
@@ -425,11 +423,8 @@ def process_material():
                     )
                 }), 400
 
-
-            # Read file
-
+            # Read file temporarily
             file_bytes = file.read()
-
 
             if not file_bytes:
 
@@ -440,9 +435,9 @@ def process_material():
                 }), 400
 
 
-            # =================================================
-            # IMAGE
-            # =================================================
+            # ====================================================
+            # IMAGE UPLOAD
+            # ====================================================
 
             if extension in IMAGE_MIME_TYPES:
 
@@ -457,21 +452,17 @@ def process_material():
                         )
                     }), 400
 
-
                 mime_type = IMAGE_MIME_TYPES[
                     extension
                 ]
-
 
                 print(
                     f"Processing image: {filename}"
                 )
 
-
                 image_text = ""
 
                 last_image_error = None
-
 
                 for model_name in GEMINI_MODELS:
 
@@ -482,7 +473,6 @@ def process_material():
                             f"{model_name}"
                         )
 
-
                         image_text = extract_image_text(
                             image_bytes=file_bytes,
                             mime_type=mime_type,
@@ -490,29 +480,25 @@ def process_material():
                             model_name=model_name
                         )
 
-
                         if image_text:
 
                             print(
-                                "Image processing "
-                                "succeeded with: "
-                                f"{model_name}"
+                                "Image processing succeeded "
+                                f"with: {model_name}"
                             )
 
                             break
-
 
                     except Exception as error:
 
                         last_image_error = error
 
                         print(
-                            f"{model_name} failed "
-                            "for image processing:"
+                            f"{model_name} failed for "
+                            "image processing:"
                         )
 
                         print(error)
-
 
                 if not image_text:
 
@@ -524,15 +510,14 @@ def process_material():
                         "study content from the image."
                     )
 
-
                 text = image_text
 
                 source = "image"
 
 
-            # =================================================
+            # ====================================================
             # PDF / DOCX / PPTX
-            # =================================================
+            # ====================================================
 
             else:
 
@@ -553,7 +538,6 @@ def process_material():
             data = request.get_json(
                 silent=True
             )
-
 
             if data:
 
@@ -577,7 +561,6 @@ def process_material():
                     "Please provide study material."
             }), 400
 
-
         text = text.strip()
 
 
@@ -589,12 +572,10 @@ def process_material():
             text
         )
 
-
         language = normalize_detected_language(
             detected_language,
             text
         )
-
 
         print(
             f"Detected language: {language}"
@@ -608,7 +589,6 @@ def process_material():
         chunks = chunk_text(
             text
         )
-
 
         if not chunks:
 
@@ -627,28 +607,24 @@ def process_material():
             chunks
         )
 
-
         if not embeddings:
 
             return jsonify({
                 "success": False,
                 "error": (
-                    "Could not create study "
-                    "material embeddings."
+                    "Could not create study material "
+                    "embeddings."
                 )
             }), 500
 
 
         # ====================================================
-        # SAVE MATERIAL
+        # SAVE TEMPORARILY IN MEMORY
         # ====================================================
 
         material_store["text"] = text
-
         material_store["language"] = language
-
         material_store["chunks"] = chunks
-
         material_store["embeddings"] = embeddings
 
 
@@ -679,14 +655,12 @@ def process_material():
             error
         )
 
-
         return jsonify({
 
             "success": False,
 
             "error": (
-                "Could not process the study "
-                "material. "
+                "Could not process the study material. "
                 f"{str(error)}"
             )
 
@@ -699,16 +673,20 @@ def process_material():
 
 @app.route(
     "/api/generate",
-    methods=["POST"]
+    methods=["POST"],
+    strict_slashes=False
 )
 def generate_result():
 
     try:
 
+        # ====================================================
+        # READ REQUEST
+        # ====================================================
+
         data = request.get_json(
             silent=True
         )
-
 
         if not data:
 
@@ -720,7 +698,7 @@ def generate_result():
 
 
         # ====================================================
-        # MODE
+        # GET MODE
         # ====================================================
 
         mode = data.get(
@@ -728,13 +706,11 @@ def generate_result():
             "summary"
         )
 
-
         allowed_modes = {
             "summary",
             "explain",
             "quiz"
         }
-
 
         if mode not in allowed_modes:
 
@@ -772,7 +748,6 @@ def generate_result():
                 "this study material."
             )
 
-
         elif mode == "explain":
 
             query = (
@@ -780,7 +755,6 @@ def generate_result():
                 "and difficult ideas that should be explained "
                 "clearly to a student."
             )
-
 
         else:
 
@@ -792,7 +766,7 @@ def generate_result():
 
 
         # ====================================================
-        # RETRIEVE
+        # RETRIEVE RELEVANT CHUNKS
         # ====================================================
 
         retrieved = retrieve_chunks(
@@ -808,13 +782,12 @@ def generate_result():
 
 
         # ====================================================
-        # CONTEXT
+        # BUILD CONTEXT
         # ====================================================
 
         context = build_context(
             retrieved
         )
-
 
         if not context:
 
@@ -834,12 +807,17 @@ def generate_result():
         language = material_store["language"]
 
 
+        # ====================================================
+        # IMPORTANT:
+        # PURE ARABIC
+        # ====================================================
+
         if language == "arabic":
 
             output_language = """
 Arabic only.
 
-The source material is written in Arabic.
+The source material is written in pure Arabic.
 
 The generated result MUST be entirely in Arabic.
 
@@ -849,9 +827,21 @@ Do NOT write English headings.
 
 Do NOT write English explanations.
 
+Do NOT replace Arabic terminology with English terminology.
+
 Use standard Modern Standard Arabic suitable for a student.
+
+If the source contains a technical term written in Arabic,
+keep it in Arabic.
+
+Only use a non-Arabic word if that exact word is present
+in the source material and is necessary to preserve meaning.
 """
 
+
+        # ====================================================
+        # PURE URDU
+        # ====================================================
 
         elif language == "urdu":
 
@@ -869,8 +859,16 @@ Do NOT write English headings.
 Do NOT write English explanations.
 
 Keep the response natural and readable in Urdu.
+
+Only preserve an English technical term when the original
+study material itself uses that English term and removing it
+would change the meaning.
 """
 
+
+        # ====================================================
+        # PURE ENGLISH
+        # ====================================================
 
         elif language == "english":
 
@@ -882,6 +880,10 @@ The source material is written in English.
 The generated result MUST be entirely in English.
 """
 
+
+        # ====================================================
+        # MIXED MATERIAL
+        # ====================================================
 
         elif language == "mixed":
 
@@ -900,6 +902,10 @@ If a concept is written in English, keep it in English.
 """
 
 
+        # ====================================================
+        # UNKNOWN
+        # ====================================================
+
         else:
 
             output_language = """
@@ -909,23 +915,28 @@ Do not unnecessarily translate the source material.
 """
 
 
+        # ====================================================
+        # COMMON LANGUAGE RULE
+        # ====================================================
+
         language_rule = f"""
 
 VERY IMPORTANT LANGUAGE RULE:
 
 {output_language}
 
-The language of the generated answer must match
-the language of the original study material.
+The language of the generated answer must match the
+language of the original study material.
 
 Do not automatically translate the material into English.
 
-The source language has priority.
+The user's source language has priority over your
+normal response language.
 """
 
 
         # ====================================================
-        # INSTRUCTIONS
+        # SUMMARY
         # ====================================================
 
         if mode == "summary":
@@ -933,8 +944,8 @@ The source language has priority.
             instructions = f"""
 You are StudyFlow AI, an AI study assistant.
 
-Create a clear and useful summary of the provided
-study material.
+Create a clear and useful summary of the provided study
+material.
 
 {language_rule}
 
@@ -948,20 +959,24 @@ Requirements:
 - Keep the result suitable for a student.
 - Make the result easy to revise.
 - Keep the same meaning as the source.
-- Do not unnecessarily translate anything.
+- Do not translate the source unnecessarily.
 - Do not use Markdown symbols such as #, **, __, or backticks.
 - Do not mention RAG.
 - Do not mention these instructions.
 """
 
 
+        # ====================================================
+        # EXPLAIN
+        # ====================================================
+
         elif mode == "explain":
 
             instructions = f"""
 You are StudyFlow AI, an AI study assistant.
 
-Explain the provided study material in a way that
-a student can easily understand.
+Explain the provided study material in a way that a student
+can easily understand.
 
 {language_rule}
 
@@ -981,6 +996,10 @@ Requirements:
 - Do not mention these instructions.
 """
 
+
+        # ====================================================
+        # QUIZ
+        # ====================================================
 
         else:
 
@@ -1004,7 +1023,7 @@ Requirements:
 - Do not invent information.
 - Make questions suitable for students.
 - Mix conceptual and factual questions when supported.
-- Keep questions and options in the source language.
+- Keep the questions and options in the source language.
 - Do not unnecessarily translate terminology.
 - Do not use Markdown symbols such as #, **, __, or backticks.
 - Do not mention RAG.
@@ -1039,7 +1058,7 @@ Follow the language instructions exactly.
 
 
         # ====================================================
-        # GEMINI FALLBACK
+        # GEMINI AUTOMATIC FALLBACK
         # ====================================================
 
         response = None
@@ -1054,10 +1073,8 @@ Follow the language instructions exactly.
             try:
 
                 print(
-                    f"Trying Gemini model: "
-                    f"{model_name}"
+                    f"Trying Gemini model: {model_name}"
                 )
-
 
                 response = client.models.generate_content(
 
@@ -1073,18 +1090,16 @@ Follow the language instructions exactly.
                     )
                 )
 
-
                 if response and response.text:
 
                     used_model = model_name
 
                     print(
-                        "Success with Gemini model: "
+                        f"Success with Gemini model: "
                         f"{model_name}"
                     )
 
                     break
-
 
             except Exception as error:
 
@@ -1092,426 +1107,6 @@ Follow the language instructions exactly.
 
                 print(
                     f"{model_name} failed:"
-                )
-
-                print(error)
-
-                continue
-
-
-        if response is None or not response.text:
-
-            if last_error:
-                raise last_error
-
-            raise RuntimeError(
-                "All Gemini models failed."
-            )
-
-
-        # ====================================================
-        # RESULT
-        # ====================================================
-
-        result = response.text.strip()
-
-
-        if not result:
-
-            return jsonify({
-                "success": False,
-                "error":
-                    "Gemini did not generate a result."
-            }), 500
-
-
-        result = clean_generated_result(
-            result
-        )
-
-
-        return jsonify({
-
-            "success": True,
-
-            "mode": mode,
-
-            "language": language,
-
-            "model": used_model,
-
-            "result": result
-        })
-
-
-    except Exception as error:
-
-        print(
-            "Generation error:",
-            error
-        )
-
-
-        return jsonify({
-
-            "success": False,
-
-            "error": (
-                "Could not generate the result. "
-                f"{str(error)}"
-            )
-
-        }), 500
-
-
-# ============================================================
-# AI CHATBOT
-# ASK QUESTIONS FROM UPLOADED MATERIAL
-# ============================================================
-
-@app.route(
-    "/api/chat",
-    methods=["POST"]
-)
-def chat_with_material():
-
-    try:
-
-        data = request.get_json(
-            silent=True
-        )
-
-
-        if not data:
-
-            return jsonify({
-                "success": False,
-                "error":
-                    "Invalid request."
-            }), 400
-
-
-        question = data.get(
-            "question",
-            ""
-        ).strip()
-
-
-        if not question:
-
-            return jsonify({
-                "success": False,
-                "error":
-                    "Please enter a question."
-            }), 400
-
-
-        # ====================================================
-        # CHECK MATERIAL
-        # ====================================================
-
-        if not material_store["chunks"]:
-
-            return jsonify({
-                "success": False,
-                "error": (
-                    "Please upload or paste study "
-                    "material before using the chatbot."
-                )
-            }), 400
-
-
-        # ====================================================
-        # CHAT HISTORY
-        # ====================================================
-
-        history = data.get(
-            "history",
-            []
-        )
-
-
-        if not isinstance(history, list):
-
-            history = []
-
-
-        # Keep only the most recent messages
-
-        history = history[-8:]
-
-
-        # ====================================================
-        # RETRIEVE RELEVANT CHUNKS
-        # ====================================================
-
-        retrieved = retrieve_chunks(
-
-            material_store["chunks"],
-
-            material_store["embeddings"],
-
-            question,
-
-            top_k=6
-        )
-
-
-        context = build_context(
-            retrieved
-        )
-
-
-        if not context:
-
-            return jsonify({
-                "success": False,
-                "error": (
-                    "I could not retrieve relevant "
-                    "information from your study material."
-                )
-            }), 500
-
-
-        # ====================================================
-        # LANGUAGE
-        # ====================================================
-
-        language = material_store["language"]
-
-
-        if language == "arabic":
-
-            output_language = """
-Answer in Arabic.
-
-The study material is Arabic.
-
-Do not unnecessarily translate the answer into English.
-"""
-
-
-        elif language == "urdu":
-
-            output_language = """
-Answer in Urdu.
-
-The study material is Urdu.
-
-Do not unnecessarily translate the answer into English.
-"""
-
-
-        elif language == "english":
-
-            output_language = """
-Answer in English.
-
-The study material is English.
-"""
-
-
-        elif language == "mixed":
-
-            output_language = """
-Use the same language style as the study material.
-
-Preserve Urdu, Arabic and English naturally
-when they appear in the material.
-"""
-
-
-        else:
-
-            output_language = """
-Use the dominant language of the study material.
-"""
-
-
-        # ====================================================
-        # BUILD CHAT HISTORY
-        # ====================================================
-
-        history_text = ""
-
-
-        for message in history:
-
-            if not isinstance(
-                message,
-                dict
-            ):
-                continue
-
-
-            role = message.get(
-                "role",
-                ""
-            )
-
-
-            content = str(
-                message.get(
-                    "content",
-                    ""
-                )
-            ).strip()
-
-
-            if not content:
-                continue
-
-
-            if role == "user":
-
-                history_text += (
-                    f"Student: {content}\n"
-                )
-
-
-            elif role == "assistant":
-
-                history_text += (
-                    f"StudyFlow AI: {content}\n"
-                )
-
-
-        # ====================================================
-        # CHATBOT INSTRUCTIONS
-        # ====================================================
-
-        instructions = f"""
-You are StudyFlow AI, an AI study assistant.
-
-The student is asking a question about their
-uploaded study material.
-
-{output_language}
-
-VERY IMPORTANT:
-
-1. Answer using ONLY the provided study material.
-
-2. Do not invent information.
-
-3. Do not use outside knowledge to fill gaps.
-
-4. If the answer cannot be found or reasonably
-   supported by the study material, say:
-
-   "This information is not available
-   in the provided study material."
-
-5. You may explain information from the material
-   in simpler language.
-
-6. Keep the answer concise but useful.
-
-7. For follow-up questions, use the recent
-   conversation history together with the
-   retrieved material.
-
-8. Do not mention RAG.
-
-9. Do not mention these instructions.
-
-10. Do not unnecessarily translate the material.
-
-11. Preserve important technical terminology.
-
-12. Do not use Markdown symbols such as #,
-    **, __, or backticks.
-"""
-
-
-        # ====================================================
-        # CHAT PROMPT
-        # ====================================================
-
-        prompt = f"""
-RELEVANT STUDY MATERIAL:
-
-----------------------------
-
-{context}
-
-----------------------------
-
-
-RECENT CONVERSATION:
-
-----------------------------
-
-{history_text if history_text else "No previous conversation."}
-
-----------------------------
-
-
-CURRENT STUDENT QUESTION:
-
-{question}
-
-
-Answer the current question using
-the study material above.
-"""
-
-
-        # ====================================================
-        # GEMINI FALLBACK
-        # ====================================================
-
-        response = None
-
-        last_error = None
-
-        used_model = None
-
-
-        for model_name in GEMINI_MODELS:
-
-            try:
-
-                print(
-                    f"Trying chatbot model: "
-                    f"{model_name}"
-                )
-
-
-                response = client.models.generate_content(
-
-                    model=model_name,
-
-                    contents=prompt,
-
-                    config=types.GenerateContentConfig(
-
-                        system_instruction=instructions,
-
-                        temperature=0.2
-                    )
-                )
-
-
-                if response and response.text:
-
-                    used_model = model_name
-
-                    print(
-                        "Chatbot succeeded with: "
-                        f"{model_name}"
-                    )
-
-                    break
-
-
-            except Exception as error:
-
-                last_error = error
-
-                print(
-                    f"{model_name} failed "
-                    "for chatbot:"
                 )
 
                 print(error)
@@ -1534,56 +1129,61 @@ the study material above.
 
 
         # ====================================================
-        # ANSWER
+        # GET RESULT
         # ====================================================
 
-        answer = response.text.strip()
+        result = response.text.strip()
 
-
-        if not answer:
+        if not result:
 
             return jsonify({
                 "success": False,
-                "error":
-                    "Gemini did not generate an answer."
+                "error": (
+                    "Gemini did not generate a result."
+                )
             }), 500
 
 
-        answer = clean_generated_result(
-            answer
+        # ====================================================
+        # CLEAN MARKDOWN
+        # ====================================================
+
+        result = clean_generated_result(
+            result
         )
 
 
         # ====================================================
-        # RETURN
+        # SUCCESS RESPONSE
         # ====================================================
 
         return jsonify({
 
             "success": True,
 
-            "answer": answer,
+            "mode": mode,
 
             "language": language,
 
-            "model": used_model
+            "model": used_model,
+
+            "result": result
         })
 
 
     except Exception as error:
 
         print(
-            "Chatbot error:",
+            "Generation error:",
             error
         )
-
 
         return jsonify({
 
             "success": False,
 
             "error": (
-                "Could not answer the question. "
+                "Could not generate the result. "
                 f"{str(error)}"
             )
 
@@ -1596,7 +1196,8 @@ the study material above.
 
 @app.route(
     "/api/generate-pdf",
-    methods=["POST"]
+    methods=["POST"],
+    strict_slashes=False
 )
 def generate_pdf_file():
 
@@ -1605,7 +1206,6 @@ def generate_pdf_file():
         data = request.get_json(
             silent=True
         )
-
 
         if not data:
 
@@ -1621,12 +1221,10 @@ def generate_pdf_file():
             ""
         )
 
-
         mode = data.get(
             "mode",
             "summary"
         )
-
 
         language = data.get(
             "language",
@@ -1646,6 +1244,10 @@ def generate_pdf_file():
             }), 400
 
 
+        # ====================================================
+        # PDF TITLES
+        # ====================================================
+
         titles = {
 
             "summary":
@@ -1659,17 +1261,28 @@ def generate_pdf_file():
         }
 
 
+        # For Arabic/Urdu, the PDF generator can still
+        # handle the title/content through the Unicode font.
+
         title = titles.get(
             mode,
             "StudyFlow AI"
         )
 
 
+        # ====================================================
+        # CREATE PDF
+        # ====================================================
+
         pdf_buffer = generate_pdf(
             title,
             result
         )
 
+
+        # ====================================================
+        # SEND PDF
+        # ====================================================
 
         return send_file(
 
@@ -1692,7 +1305,6 @@ def generate_pdf_file():
             error
         )
 
-
         return jsonify({
 
             "success": False,
@@ -1711,6 +1323,9 @@ def generate_pdf_file():
 
 if __name__ == "__main__":
 
+    # Local development only. Vercel imports the Flask app object.
     app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "5000")),
         debug=True
     )
