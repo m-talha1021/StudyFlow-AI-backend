@@ -68,14 +68,12 @@ CORS(
     resources={
         r"/api/*": {
             "origins": [
-                "https://study-flow-ai-lac.vercel.app",
-                "https://study-flow-assistant.netlify.app",
-                "http://localhost:5173"
+                "https://study-flow-ai-lac.vercel.app"
             ]
         }
     },
     methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"]
+    allow_headers=["Content-Type", "Authorization"]
 )
 
 
