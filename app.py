@@ -376,7 +376,7 @@ def test_api():
 
 @app.route(
     "/api/material",
-    methods=["POST", "OPTIONS"])
+    methods=["POST"]
 )
 def process_material():
 
