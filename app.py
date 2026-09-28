@@ -70,8 +70,6 @@ app = Flask(__name__)
 ALLOWED_ORIGINS = {
     "https://study-flow-ai-lac.vercel.app",
     "https://www.study-flow-ai-lac.vercel.app",
-    "http://localhost:5173",
-    "http://localhost:3000",
 }
 
 CORS(
