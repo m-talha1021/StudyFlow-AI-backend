@@ -583,166 +583,147 @@ def process_material():
     try:
 
         text = ""
-
-        filename = None
-
+        filenames = []
         source = None
 
-
         # ====================================================
-        # FILE UPLOAD
+        # MULTIPLE FILE UPLOAD
         # ====================================================
 
-        if "file" in request.files:
+        uploaded_files = request.files.getlist("files")
 
-            file = request.files["file"]
+        # Backward compatibility with the previous single-file
+        # frontend, which used the field name "file".
+        if not uploaded_files and "file" in request.files:
+            uploaded_files = [request.files["file"]]
 
-            if file.filename == "":
+        if uploaded_files:
 
+            if len(uploaded_files) > 10:
                 return jsonify({
                     "success": False,
-                    "error":
-                        "No file was selected."
+                    "error": "Please upload a maximum of 10 files at a time."
                 }), 400
 
+            extracted_parts = []
 
-            filename = file.filename
+            for file in uploaded_files:
 
-            extension = filename.rsplit(
-                ".",
-                1
-            )[-1].lower()
+                if not file or file.filename == "":
+                    continue
 
+                filename = file.filename
+                filenames.append(filename)
 
-            if extension not in ALLOWED_EXTENSIONS:
+                extension = filename.rsplit(
+                    ".",
+                    1
+                )[-1].lower()
 
-                return jsonify({
-                    "success": False,
-                    "error": (
-                        "Supported files are "
-                        "PDF, DOCX, PPTX, PNG, JPG, "
-                        "JPEG, WEBP, HEIC and HEIF."
-                    )
-                }), 400
-
-
-            # Read file
-
-            file_bytes = file.read()
-
-
-            if not file_bytes:
-
-                return jsonify({
-                    "success": False,
-                    "error":
-                        "The uploaded file is empty."
-                }), 400
-
-
-            # =================================================
-            # IMAGE
-            # =================================================
-
-            if extension in IMAGE_MIME_TYPES:
-
-                if len(file_bytes) > MAX_IMAGE_SIZE:
-
+                if extension not in ALLOWED_EXTENSIONS:
                     return jsonify({
                         "success": False,
                         "error": (
-                            "Image is too large. "
-                            "Please upload an image "
-                            "smaller than 15 MB."
+                            f"Unsupported file: {filename}. "
+                            "Supported files are PDF, DOCX, PPTX, PNG, JPG, "
+                            "JPEG, WEBP, HEIC and HEIF."
                         )
                     }), 400
 
+                file_bytes = file.read()
 
-                mime_type = IMAGE_MIME_TYPES[
-                    extension
-                ]
+                if not file_bytes:
+                    return jsonify({
+                        "success": False,
+                        "error": f"The uploaded file is empty: {filename}."
+                    }), 400
 
+                # ------------------------------------------------
+                # IMAGE
+                # ------------------------------------------------
 
-                print(
-                    f"Processing image: {filename}"
-                )
+                if extension in IMAGE_MIME_TYPES:
 
+                    if len(file_bytes) > MAX_IMAGE_SIZE:
+                        return jsonify({
+                            "success": False,
+                            "error": (
+                                f"Image '{filename}' is too large. "
+                                "Please upload an image smaller than 15 MB."
+                            )
+                        }), 400
 
-                image_text = ""
+                    mime_type = IMAGE_MIME_TYPES[extension]
 
-                last_image_error = None
+                    print(f"Processing image: {filename}")
 
+                    image_text = ""
+                    last_image_error = None
 
-                for model_name in GEMINI_MODELS:
-
-                    try:
-
-                        print(
-                            f"Trying image model: "
-                            f"{model_name}"
-                        )
-
-
-                        image_text = extract_image_text(
-                            image_bytes=file_bytes,
-                            mime_type=mime_type,
-                            client=client,
-                            model_name=model_name
-                        )
-
-
-                        if image_text:
-
+                    for model_name in GEMINI_MODELS:
+                        try:
                             print(
-                                "Image processing "
-                                "succeeded with: "
-                                f"{model_name}"
+                                f"Trying image model: {model_name} "
+                                f"for {filename}"
                             )
 
-                            break
+                            image_text = extract_image_text(
+                                image_bytes=file_bytes,
+                                mime_type=mime_type,
+                                client=client,
+                                model_name=model_name
+                            )
 
+                            if image_text:
+                                print(
+                                    "Image processing succeeded with: "
+                                    f"{model_name} for {filename}"
+                                )
+                                break
 
-                    except Exception as error:
+                        except Exception as error:
+                            last_image_error = error
+                            print(
+                                f"{model_name} failed for image "
+                                f"{filename}:"
+                            )
+                            print(error)
 
-                        last_image_error = error
-
-                        print(
-                            f"{model_name} failed "
-                            "for image processing:"
+                    if not image_text:
+                        if last_image_error:
+                            raise last_image_error
+                        raise RuntimeError(
+                            f"Could not extract readable study content "
+                            f"from image: {filename}."
                         )
 
-                        print(error)
-
-
-                if not image_text:
-
-                    if last_image_error:
-                        raise last_image_error
-
-                    raise RuntimeError(
-                        "Could not extract readable "
-                        "study content from the image."
+                    extracted_parts.append(
+                        f"\n\n===== {filename} =====\n\n{image_text.strip()}"
                     )
 
+                # ------------------------------------------------
+                # PDF / DOCX / PPTX
+                # ------------------------------------------------
 
-                text = image_text
+                else:
+                    extracted_text = extract_text(
+                        file_bytes,
+                        filename
+                    )
 
-                source = "image"
+                    if extracted_text and extracted_text.strip():
+                        extracted_parts.append(
+                            f"\n\n===== {filename} =====\n\n{extracted_text.strip()}"
+                        )
 
+            if not extracted_parts:
+                return jsonify({
+                    "success": False,
+                    "error": "No readable files were selected."
+                }), 400
 
-            # =================================================
-            # PDF / DOCX / PPTX
-            # =================================================
-
-            else:
-
-                text = extract_text(
-                    file_bytes,
-                    filename
-                )
-
-                source = "file"
-
+            text = "\n".join(extracted_parts).strip()
+            source = "files" if len(filenames) > 1 else "file"
 
         # ====================================================
         # PASTED TEXT
@@ -754,123 +735,85 @@ def process_material():
                 silent=True
             )
 
-
             if data:
-
                 text = data.get(
                     "text",
                     ""
                 ).strip()
-
                 source = "text"
-
 
         # ====================================================
         # CHECK MATERIAL
         # ====================================================
 
         if not text or not text.strip():
-
             return jsonify({
                 "success": False,
-                "error":
-                    "Please provide study material."
+                "error": "Please provide study material."
             }), 400
 
-
         text = text.strip()
-
 
         # ====================================================
         # DETECT LANGUAGE
         # ====================================================
 
-        detected_language = detect_language(
-            text
-        )
-
+        detected_language = detect_language(text)
 
         language = normalize_detected_language(
             detected_language,
             text
         )
 
-
-        print(
-            f"Detected language: {language}"
-        )
-
+        print(f"Detected language: {language}")
 
         # ====================================================
         # CREATE CHUNKS
         # ====================================================
 
-        chunks = chunk_text(
-            text
-        )
-
+        chunks = chunk_text(text)
 
         if not chunks:
-
             return jsonify({
                 "success": False,
-                "error":
-                    "Could not create text chunks."
+                "error": "Could not create text chunks."
             }), 400
-
 
         # ====================================================
         # CREATE EMBEDDINGS
         # ====================================================
 
-        embeddings = create_embeddings(
-            chunks
-        )
-
+        embeddings = create_embeddings(chunks)
 
         if not embeddings:
-
             return jsonify({
                 "success": False,
-                "error": (
-                    "Could not create study "
-                    "material embeddings."
-                )
+                "error": "Could not create study material embeddings."
             }), 500
-
 
         # ====================================================
         # SAVE MATERIAL
         # ====================================================
 
         material_store["text"] = text
-
         material_store["language"] = language
-
         material_store["chunks"] = chunks
-
         material_store["embeddings"] = embeddings
-
 
         # ====================================================
         # RESPONSE
         # ====================================================
 
         return jsonify({
-
             "success": True,
-
             "source": source,
-
-            "filename": filename,
-
+            "filename": filenames[0] if filenames else None,
+            "filenames": filenames,
+            "file_count": len(filenames),
             "characters": len(text),
-
             "language": language,
-
             "chunks": len(chunks)
         })
-
 
     except Exception as error:
 
@@ -879,17 +822,12 @@ def process_material():
             error
         )
 
-
         return jsonify({
-
             "success": False,
-
             "error": (
-                "Could not process the study "
-                "material. "
+                "Could not process the study material. "
                 f"{str(error)}"
             )
-
         }), 500
 
 
