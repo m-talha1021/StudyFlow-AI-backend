@@ -10,3 +10,4 @@ python-pptx
 langdetect
 arabic-reshaper
 python-bidi
+openai
