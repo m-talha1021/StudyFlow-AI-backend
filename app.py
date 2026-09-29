@@ -1307,6 +1307,228 @@ Follow the language instructions exactly.
         }), 500
 
 
+
+# ============================================================
+# FLASHCARDS
+# ============================================================
+
+@app.route(
+    "/api/flashcards",
+    methods=["POST"]
+)
+def generate_flashcards():
+    """
+    Generate concise front/back flashcards from the currently
+    processed study material. Uses the same Gemini -> OpenAI
+    fallback chain as the rest of the application.
+    """
+
+    try:
+        data = request.get_json(silent=True) or {}
+
+        try:
+            count = int(data.get("count", 10))
+        except (TypeError, ValueError):
+            count = 10
+
+        # Keep the endpoint predictable and protect token usage.
+        count = max(5, min(count, 20))
+
+        if not material_store["chunks"]:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "Please upload or paste study material first."
+                )
+            }), 400
+
+        language = material_store["language"]
+
+        if language == "arabic":
+            language_rule = """
+Generate every flashcard in Arabic only.
+Do not translate the source material into English.
+"""
+        elif language == "urdu":
+            language_rule = """
+Generate every flashcard in Urdu only.
+Do not translate the source material into English.
+"""
+        elif language == "english":
+            language_rule = """
+Generate every flashcard in English only.
+"""
+        elif language == "mixed":
+            language_rule = """
+Use the same language style as the study material.
+Preserve Urdu, Arabic and English naturally where they
+appear in the source.
+"""
+        else:
+            language_rule = """
+Use the dominant language of the study material.
+Do not unnecessarily translate the source.
+"""
+
+        query = (
+            "Find the most important concepts, definitions, "
+            "facts, processes, relationships and exam-relevant "
+            "ideas that can be converted into flashcards."
+        )
+
+        retrieved = retrieve_chunks(
+            material_store["chunks"],
+            material_store["embeddings"],
+            query,
+            top_k=min(10, max(6, count))
+        )
+
+        context = build_context(retrieved)
+
+        if not context:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "Could not retrieve relevant study material "
+                    "for flashcards."
+                )
+            }), 500
+
+        instructions = f"""
+You are StudyFlow AI, an AI study assistant.
+
+Create exactly {count} flashcards from the provided study
+material.
+
+{language_rule}
+
+IMPORTANT:
+- Use ONLY information supported by the provided context.
+- Do not invent facts.
+- Do not use outside knowledge.
+- Each flashcard must test one important concept.
+- The front must be a concise question or prompt.
+- The back must be a concise, accurate answer.
+- Keep each front and back easy to read.
+- Avoid duplicate cards.
+- Return ONLY valid JSON.
+- Do not use Markdown code fences.
+- Do not add commentary before or after the JSON.
+
+Return exactly this structure:
+
+[
+  {{
+    "front": "Question or prompt",
+    "back": "Short answer"
+  }}
+]
+"""
+
+        prompt = f"""
+Study material context:
+
+--------------------
+
+{context}
+
+--------------------
+
+Detected source language:
+{language}
+
+Generate exactly {count} flashcards.
+Return ONLY the JSON array requested above.
+"""
+
+        ai_result = generate_ai_response(
+            prompt=prompt,
+            system_instruction=instructions,
+            temperature=0.2
+        )
+
+        raw = ai_result["text"].strip()
+
+        # Remove accidental Markdown fences.
+        raw = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            raw,
+            flags=re.IGNORECASE
+        )
+        raw = re.sub(
+            r"\s*```$",
+            "",
+            raw
+        ).strip()
+
+        # Extract the JSON array if a model added a small amount
+        # of surrounding text.
+        start = raw.find("[")
+        end = raw.rfind("]")
+
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError(
+                "The AI returned an invalid flashcard format."
+            )
+
+        json_text = raw[start:end + 1]
+
+        import json
+
+        cards = json.loads(json_text)
+
+        if not isinstance(cards, list):
+            raise ValueError(
+                "The AI did not return a flashcard list."
+            )
+
+        cleaned_cards = []
+
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+
+            front = str(card.get("front", "")).strip()
+            back = str(card.get("back", "")).strip()
+
+            if not front or not back:
+                continue
+
+            cleaned_cards.append({
+                "front": front,
+                "back": back
+            })
+
+            if len(cleaned_cards) >= count:
+                break
+
+        if len(cleaned_cards) < count:
+            raise ValueError(
+                "The AI did not generate enough valid flashcards."
+            )
+
+        return jsonify({
+            "success": True,
+            "cards": cleaned_cards,
+            "count": len(cleaned_cards),
+            "language": language,
+            "provider": ai_result["provider"],
+            "model": ai_result["model"]
+        })
+
+    except Exception as error:
+        print("Flashcards error:", error)
+
+        return jsonify({
+            "success": False,
+            "error": (
+                "Could not generate flashcards. "
+                f"{str(error)}"
+            )
+        }), 500
+
+
 # ============================================================
 # AI CHATBOT
 # ASK QUESTIONS FROM UPLOADED MATERIAL
