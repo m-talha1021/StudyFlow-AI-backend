@@ -6,7 +6,6 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 
 from google import genai
-from openai import OpenAI
 from google.genai import types
 
 from document_parser import extract_text
@@ -27,18 +26,14 @@ from pdf_generator import generate_pdf
 # ENVIRONMENT
 # ============================================================
 
-# ============================================================
-# API KEYS
-# ============================================================
+load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 
 if not GEMINI_API_KEY:
     raise RuntimeError(
         "GEMINI_API_KEY is missing. "
-        "Please add it to your environment variables."
+        "Please add it to your .env file."
     )
 
 
@@ -49,18 +44,6 @@ if not GEMINI_API_KEY:
 client = genai.Client(
     api_key=GEMINI_API_KEY
 )
-
-
-# ============================================================
-# OPENAI CLIENT
-# ============================================================
-
-openai_client = None
-
-if OPENAI_API_KEY:
-    openai_client = OpenAI(
-        api_key=OPENAI_API_KEY
-    )
 
 
 # ============================================================
@@ -75,73 +58,12 @@ GEMINI_MODELS = [
 
 
 # ============================================================
-# OPENAI MODELS
-# ============================================================
-
-OPENAI_MODELS = [
-    "gpt-6-luna",
-    "gpt-5.6-luna",
-    "gpt-5.4-mini",
-    "gpt-5.1",
-    "gpt-4.1-mini",
-]
-
-# ============================================================
 # FLASK APP
 # ============================================================
 
 app = Flask(__name__)
 
-# ============================================================
-# CORS / VERCEL FRONTEND
-# ============================================================
-
-ALLOWED_ORIGINS = {
-    "https://study-flow-ai-lac.vercel.app",
-    "https://www.study-flow-ai-lac.vercel.app",
-}
-
-CORS(
-    app,
-    resources={
-        r"/api/*": {
-            "origins": list(ALLOWED_ORIGINS),
-            "methods": ["GET", "POST", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization"],
-            "expose_headers": ["Content-Disposition"],
-        }
-    },
-    supports_credentials=False,
-)
-
-
-@app.before_request
-def handle_cors_preflight():
-    # Explicitly answer browser preflight requests.
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-
-@app.after_request
-def add_cors_headers(response):
-    # Also add CORS headers to error responses so the browser can
-    # display the real backend error instead of hiding it as CORS.
-    origin = request.headers.get("Origin")
-
-    if origin in ALLOWED_ORIGINS:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Vary"] = "Origin"
-        response.headers["Access-Control-Allow-Methods"] = (
-            "GET, POST, OPTIONS"
-        )
-        response.headers["Access-Control-Allow-Headers"] = (
-            "Content-Type, Authorization"
-        )
-        response.headers["Access-Control-Expose-Headers"] = (
-            "Content-Disposition"
-        )
-
-    return response
+CORS(app)
 
 
 # ============================================================
@@ -410,139 +332,6 @@ def clean_generated_result(text):
 
 
 # ============================================================
-# AI TEXT GENERATION WITH AUTOMATIC FALLBACK
-# ============================================================
-
-def generate_ai_response(
-    prompt,
-    system_instruction=None,
-    temperature=0.2
-):
-    """
-    Generate a text response using Gemini first.
-
-    If every configured Gemini model fails, automatically try
-    the configured OpenAI models in order.
-
-    Returns a dictionary containing the generated text, provider
-    and model that actually produced the response.
-    """
-
-    last_error = None
-
-    # --------------------------------------------------------
-    # 1. TRY GEMINI MODELS
-    # --------------------------------------------------------
-
-    for model_name in GEMINI_MODELS:
-
-        try:
-
-            print(
-                f"[AI] Trying Gemini model: {model_name}"
-            )
-
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=temperature
-                )
-            )
-
-            if response and response.text:
-
-                print(
-                    f"[AI] Gemini succeeded: {model_name}"
-                )
-
-                return {
-                    "text": response.text,
-                    "provider": "Gemini",
-                    "model": model_name
-                }
-
-        except Exception as error:
-
-            last_error = error
-
-            print(
-                f"[AI] Gemini failed: {model_name}"
-            )
-            print(error)
-
-            continue
-
-    # --------------------------------------------------------
-    # 2. GEMINI FAILED → TRY OPENAI MODELS
-    # --------------------------------------------------------
-
-    if openai_client is not None:
-
-        for model_name in OPENAI_MODELS:
-
-            try:
-
-                print(
-                    f"[AI] Trying OpenAI model: {model_name}"
-                )
-
-                request_args = {
-                    "model": model_name,
-                    "input": prompt
-                }
-
-                if system_instruction:
-                    request_args["instructions"] = system_instruction
-
-                response = openai_client.responses.create(
-                    **request_args
-                )
-
-                if response and response.output_text:
-
-                    print(
-                        f"[AI] OpenAI succeeded: {model_name}"
-                    )
-
-                    return {
-                        "text": response.output_text,
-                        "provider": "OpenAI",
-                        "model": model_name
-                    }
-
-            except Exception as error:
-
-                last_error = error
-
-                print(
-                    f"[AI] OpenAI failed: {model_name}"
-                )
-                print(error)
-
-                continue
-
-    else:
-
-        print(
-            "[AI] OPENAI_API_KEY is not configured; "
-            "skipping OpenAI fallback."
-        )
-
-    # --------------------------------------------------------
-    # 3. ALL TEXT MODELS FAILED
-    # --------------------------------------------------------
-
-    if last_error:
-        raise last_error
-
-    raise RuntimeError(
-        "All configured AI models are currently unavailable."
-    )
-
-
-# ============================================================
 # HOME
 # ============================================================
 
@@ -582,167 +371,152 @@ def process_material():
 
     try:
 
-        text = ""
-
-        filename = None
-
+        text_parts = []
+        filenames = []
         source = None
 
-
         # ====================================================
-        # FILE UPLOAD
+        # MULTIPLE FILE UPLOAD
         # ====================================================
 
-        if "file" in request.files:
+        uploaded_files = request.files.getlist("files")
 
-            file = request.files["file"]
+        # Backward compatibility: also accept the old single-file
+        # field used by older frontend versions.
+        if not uploaded_files and "file" in request.files:
+            uploaded_files = [request.files["file"]]
 
-            if file.filename == "":
+        if uploaded_files:
 
+            if len(uploaded_files) > 10:
                 return jsonify({
                     "success": False,
-                    "error":
-                        "No file was selected."
+                    "error": "You can upload a maximum of 10 files at a time."
                 }), 400
 
+            last_image_error = None
 
-            filename = file.filename
+            for file in uploaded_files:
 
-            extension = filename.rsplit(
-                ".",
-                1
-            )[-1].lower()
+                if not file or not file.filename:
+                    continue
 
+                filename = file.filename
+                filenames.append(filename)
 
-            if extension not in ALLOWED_EXTENSIONS:
+                extension = filename.rsplit(
+                    ".",
+                    1
+                )[-1].lower()
 
-                return jsonify({
-                    "success": False,
-                    "error": (
-                        "Supported files are "
-                        "PDF, DOCX, PPTX, PNG, JPG, "
-                        "JPEG, WEBP, HEIC and HEIF."
-                    )
-                }), 400
-
-
-            # Read file
-
-            file_bytes = file.read()
-
-
-            if not file_bytes:
-
-                return jsonify({
-                    "success": False,
-                    "error":
-                        "The uploaded file is empty."
-                }), 400
-
-
-            # =================================================
-            # IMAGE
-            # =================================================
-
-            if extension in IMAGE_MIME_TYPES:
-
-                if len(file_bytes) > MAX_IMAGE_SIZE:
-
+                if extension not in ALLOWED_EXTENSIONS:
                     return jsonify({
                         "success": False,
                         "error": (
-                            "Image is too large. "
-                            "Please upload an image "
-                            "smaller than 15 MB."
+                            f"Unsupported file: {filename}. "
+                            "Supported files are PDF, DOCX, PPTX, PNG, "
+                            "JPG, JPEG, WEBP, HEIC and HEIF."
                         )
                     }), 400
 
+                file_bytes = file.read()
 
-                mime_type = IMAGE_MIME_TYPES[
-                    extension
-                ]
+                if not file_bytes:
+                    return jsonify({
+                        "success": False,
+                        "error": f"The uploaded file is empty: {filename}."
+                    }), 400
 
+                # =================================================
+                # IMAGE
+                # =================================================
 
-                print(
-                    f"Processing image: {filename}"
-                )
+                if extension in IMAGE_MIME_TYPES:
 
-
-                image_text = ""
-
-                last_image_error = None
-
-
-                for model_name in GEMINI_MODELS:
-
-                    try:
-
-                        print(
-                            f"Trying image model: "
-                            f"{model_name}"
-                        )
-
-
-                        image_text = extract_image_text(
-                            image_bytes=file_bytes,
-                            mime_type=mime_type,
-                            client=client,
-                            model_name=model_name
-                        )
-
-
-                        if image_text:
-
-                            print(
-                                "Image processing "
-                                "succeeded with: "
-                                f"{model_name}"
+                    if len(file_bytes) > MAX_IMAGE_SIZE:
+                        return jsonify({
+                            "success": False,
+                            "error": (
+                                f"Image '{filename}' is too large. "
+                                "Please upload images smaller than 15 MB."
                             )
+                        }), 400
 
-                            break
+                    mime_type = IMAGE_MIME_TYPES[extension]
+                    image_text = ""
+                    last_image_error = None
 
-
-                    except Exception as error:
-
-                        last_image_error = error
-
-                        print(
-                            f"{model_name} failed "
-                            "for image processing:"
-                        )
-
-                        print(error)
-
-
-                if not image_text:
-
-                    if last_image_error:
-                        raise last_image_error
-
-                    raise RuntimeError(
-                        "Could not extract readable "
-                        "study content from the image."
+                    print(
+                        f"Processing image: {filename}"
                     )
 
+                    for model_name in GEMINI_MODELS:
 
-                text = image_text
+                        try:
+                            print(
+                                f"Trying image model: {model_name}"
+                            )
 
-                source = "image"
+                            image_text = extract_image_text(
+                                image_bytes=file_bytes,
+                                mime_type=mime_type,
+                                client=client,
+                                model_name=model_name
+                            )
 
+                            if image_text:
+                                print(
+                                    "Image processing succeeded with: "
+                                    f"{model_name}"
+                                )
+                                break
 
-            # =================================================
-            # PDF / DOCX / PPTX
-            # =================================================
+                        except Exception as error:
+                            last_image_error = error
+                            print(
+                                f"{model_name} failed for image processing:"
+                            )
+                            print(error)
 
-            else:
+                    if not image_text:
+                        if last_image_error:
+                            raise RuntimeError(
+                                f"Could not process image '{filename}': "
+                                f"{last_image_error}"
+                            )
 
-                text = extract_text(
-                    file_bytes,
-                    filename
-                )
+                        raise RuntimeError(
+                            f"Could not extract readable study content from '{filename}'."
+                        )
 
-                source = "file"
+                    text_parts.append(
+                        f"\n\n===== {filename} =====\n\n{image_text}"
+                    )
 
+                # =================================================
+                # PDF / DOCX / PPTX
+                # =================================================
+
+                else:
+
+                    extracted_text = extract_text(
+                        file_bytes,
+                        filename
+                    )
+
+                    if extracted_text and extracted_text.strip():
+                        text_parts.append(
+                            f"\n\n===== {filename} =====\n\n{extracted_text}"
+                        )
+                    else:
+                        return jsonify({
+                            "success": False,
+                            "error": (
+                                f"No readable text was found in '{filename}'."
+                            )
+                        }), 400
+
+            source = "files"
 
         # ====================================================
         # PASTED TEXT
@@ -754,32 +528,27 @@ def process_material():
                 silent=True
             )
 
-
             if data:
-
-                text = data.get(
+                pasted_text = data.get(
                     "text",
                     ""
                 ).strip()
 
-                source = "text"
-
+                if pasted_text:
+                    text_parts.append(pasted_text)
+                    source = "text"
 
         # ====================================================
-        # CHECK MATERIAL
+        # COMBINE MATERIAL
         # ====================================================
 
-        if not text or not text.strip():
+        text = "\n".join(text_parts).strip()
 
+        if not text:
             return jsonify({
                 "success": False,
-                "error":
-                    "Please provide study material."
+                "error": "Please provide study material."
             }), 400
-
-
-        text = text.strip()
-
 
         # ====================================================
         # DETECT LANGUAGE
@@ -789,17 +558,14 @@ def process_material():
             text
         )
 
-
         language = normalize_detected_language(
             detected_language,
             text
         )
 
-
         print(
             f"Detected language: {language}"
         )
-
 
         # ====================================================
         # CREATE CHUNKS
@@ -809,15 +575,11 @@ def process_material():
             text
         )
 
-
         if not chunks:
-
             return jsonify({
                 "success": False,
-                "error":
-                    "Could not create text chunks."
+                "error": "Could not create text chunks."
             }), 400
-
 
         # ====================================================
         # CREATE EMBEDDINGS
@@ -827,50 +589,37 @@ def process_material():
             chunks
         )
 
-
         if not embeddings:
-
             return jsonify({
                 "success": False,
                 "error": (
-                    "Could not create study "
-                    "material embeddings."
+                    "Could not create study material embeddings."
                 )
             }), 500
-
 
         # ====================================================
         # SAVE MATERIAL
         # ====================================================
 
         material_store["text"] = text
-
         material_store["language"] = language
-
         material_store["chunks"] = chunks
-
         material_store["embeddings"] = embeddings
-
 
         # ====================================================
         # RESPONSE
         # ====================================================
 
         return jsonify({
-
             "success": True,
-
             "source": source,
-
-            "filename": filename,
-
+            "filename": filenames[0] if len(filenames) == 1 else None,
+            "filenames": filenames,
+            "file_count": len(filenames),
             "characters": len(text),
-
             "language": language,
-
             "chunks": len(chunks)
         })
-
 
     except Exception as error:
 
@@ -879,17 +628,12 @@ def process_material():
             error
         )
 
-
         return jsonify({
-
             "success": False,
-
             "error": (
-                "Could not process the study "
-                "material. "
+                "Could not process the study material. "
                 f"{str(error)}"
             )
-
         }), 500
 
 
@@ -1239,30 +983,89 @@ Follow the language instructions exactly.
 
 
         # ====================================================
-        # AI GENERATION WITH GEMINI → OPENAI FALLBACK
+        # GEMINI FALLBACK
         # ====================================================
 
-        ai_result = generate_ai_response(
-            prompt=prompt,
-            system_instruction=instructions,
-            temperature=0.2
-        )
+        response = None
 
-        result = ai_result["text"].strip()
+        last_error = None
 
-        used_provider = ai_result["provider"]
-        used_model = ai_result["model"]
+        used_model = None
+
+
+        for model_name in GEMINI_MODELS:
+
+            try:
+
+                print(
+                    f"Trying Gemini model: "
+                    f"{model_name}"
+                )
+
+
+                response = client.models.generate_content(
+
+                    model=model_name,
+
+                    contents=prompt,
+
+                    config=types.GenerateContentConfig(
+
+                        system_instruction=instructions,
+
+                        temperature=0.2
+                    )
+                )
+
+
+                if response and response.text:
+
+                    used_model = model_name
+
+                    print(
+                        "Success with Gemini model: "
+                        f"{model_name}"
+                    )
+
+                    break
+
+
+            except Exception as error:
+
+                last_error = error
+
+                print(
+                    f"{model_name} failed:"
+                )
+
+                print(error)
+
+                continue
+
+
+        if response is None or not response.text:
+
+            if last_error:
+                raise last_error
+
+            raise RuntimeError(
+                "All Gemini models failed."
+            )
+
 
         # ====================================================
         # RESULT
         # ====================================================
+
+        result = response.text.strip()
+
 
         if not result:
 
             return jsonify({
                 "success": False,
                 "error":
-                    "The AI did not generate a result."
+                    "Gemini did not generate a result."
             }), 500
 
 
@@ -1278,8 +1081,6 @@ Follow the language instructions exactly.
             "mode": mode,
 
             "language": language,
-
-            "provider": used_provider,
 
             "model": used_model,
 
@@ -1307,228 +1108,6 @@ Follow the language instructions exactly.
         }), 500
 
 
-
-# ============================================================
-# FLASHCARDS
-# ============================================================
-
-@app.route(
-    "/api/flashcards",
-    methods=["POST"]
-)
-def generate_flashcards():
-    """
-    Generate concise front/back flashcards from the currently
-    processed study material. Uses the same Gemini -> OpenAI
-    fallback chain as the rest of the application.
-    """
-
-    try:
-        data = request.get_json(silent=True) or {}
-
-        try:
-            count = int(data.get("count", 10))
-        except (TypeError, ValueError):
-            count = 10
-
-        # Keep the endpoint predictable and protect token usage.
-        count = max(5, min(count, 20))
-
-        if not material_store["chunks"]:
-            return jsonify({
-                "success": False,
-                "error": (
-                    "Please upload or paste study material first."
-                )
-            }), 400
-
-        language = material_store["language"]
-
-        if language == "arabic":
-            language_rule = """
-Generate every flashcard in Arabic only.
-Do not translate the source material into English.
-"""
-        elif language == "urdu":
-            language_rule = """
-Generate every flashcard in Urdu only.
-Do not translate the source material into English.
-"""
-        elif language == "english":
-            language_rule = """
-Generate every flashcard in English only.
-"""
-        elif language == "mixed":
-            language_rule = """
-Use the same language style as the study material.
-Preserve Urdu, Arabic and English naturally where they
-appear in the source.
-"""
-        else:
-            language_rule = """
-Use the dominant language of the study material.
-Do not unnecessarily translate the source.
-"""
-
-        query = (
-            "Find the most important concepts, definitions, "
-            "facts, processes, relationships and exam-relevant "
-            "ideas that can be converted into flashcards."
-        )
-
-        retrieved = retrieve_chunks(
-            material_store["chunks"],
-            material_store["embeddings"],
-            query,
-            top_k=min(10, max(6, count))
-        )
-
-        context = build_context(retrieved)
-
-        if not context:
-            return jsonify({
-                "success": False,
-                "error": (
-                    "Could not retrieve relevant study material "
-                    "for flashcards."
-                )
-            }), 500
-
-        instructions = f"""
-You are StudyFlow AI, an AI study assistant.
-
-Create exactly {count} flashcards from the provided study
-material.
-
-{language_rule}
-
-IMPORTANT:
-- Use ONLY information supported by the provided context.
-- Do not invent facts.
-- Do not use outside knowledge.
-- Each flashcard must test one important concept.
-- The front must be a concise question or prompt.
-- The back must be a concise, accurate answer.
-- Keep each front and back easy to read.
-- Avoid duplicate cards.
-- Return ONLY valid JSON.
-- Do not use Markdown code fences.
-- Do not add commentary before or after the JSON.
-
-Return exactly this structure:
-
-[
-  {{
-    "front": "Question or prompt",
-    "back": "Short answer"
-  }}
-]
-"""
-
-        prompt = f"""
-Study material context:
-
---------------------
-
-{context}
-
---------------------
-
-Detected source language:
-{language}
-
-Generate exactly {count} flashcards.
-Return ONLY the JSON array requested above.
-"""
-
-        ai_result = generate_ai_response(
-            prompt=prompt,
-            system_instruction=instructions,
-            temperature=0.2
-        )
-
-        raw = ai_result["text"].strip()
-
-        # Remove accidental Markdown fences.
-        raw = re.sub(
-            r"^```(?:json)?\s*",
-            "",
-            raw,
-            flags=re.IGNORECASE
-        )
-        raw = re.sub(
-            r"\s*```$",
-            "",
-            raw
-        ).strip()
-
-        # Extract the JSON array if a model added a small amount
-        # of surrounding text.
-        start = raw.find("[")
-        end = raw.rfind("]")
-
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError(
-                "The AI returned an invalid flashcard format."
-            )
-
-        json_text = raw[start:end + 1]
-
-        import json
-
-        cards = json.loads(json_text)
-
-        if not isinstance(cards, list):
-            raise ValueError(
-                "The AI did not return a flashcard list."
-            )
-
-        cleaned_cards = []
-
-        for card in cards:
-            if not isinstance(card, dict):
-                continue
-
-            front = str(card.get("front", "")).strip()
-            back = str(card.get("back", "")).strip()
-
-            if not front or not back:
-                continue
-
-            cleaned_cards.append({
-                "front": front,
-                "back": back
-            })
-
-            if len(cleaned_cards) >= count:
-                break
-
-        if len(cleaned_cards) < count:
-            raise ValueError(
-                "The AI did not generate enough valid flashcards."
-            )
-
-        return jsonify({
-            "success": True,
-            "cards": cleaned_cards,
-            "count": len(cleaned_cards),
-            "language": language,
-            "provider": ai_result["provider"],
-            "model": ai_result["model"]
-        })
-
-    except Exception as error:
-        print("Flashcards error:", error)
-
-        return jsonify({
-            "success": False,
-            "error": (
-                "Could not generate flashcards. "
-                f"{str(error)}"
-            )
-        }), 500
-
-
 # ============================================================
 # AI CHATBOT
 # ASK QUESTIONS FROM UPLOADED MATERIAL
@@ -1536,34 +1115,29 @@ Return ONLY the JSON array requested above.
 
 @app.route(
     "/api/chat",
-    methods=["GET", "POST", "OPTIONS"],
-    strict_slashes=False
+    methods=["POST"]
 )
 def chat_with_material():
-
-    # GET is intentionally supported as a deployment diagnostic.
-    # Open /api/chat in the browser after deployment; a JSON response
-    # proves that the Vercel deployment contains this route.
-    if request.method == "GET":
-        return jsonify({
-            "success": True,
-            "message": "StudyFlow AI chatbot endpoint is running.",
-            "endpoint": "/api/chat",
-            "method": "POST"
-        })
-
-    if request.method == "OPTIONS":
-        return ("", 204)
 
     try:
 
         data = request.get_json(
             silent=True
-        ) or {}
+        )
 
 
-        question = str(
-            data.get("question", "")
+        if not data:
+
+            return jsonify({
+                "success": False,
+                "error":
+                    "Invalid request."
+            }), 400
+
+
+        question = data.get(
+            "question",
+            ""
         ).strip()
 
 
@@ -1828,23 +1402,87 @@ the study material above.
 
 
         # ====================================================
-        # AI CHAT WITH GEMINI → OPENAI FALLBACK
+        # GEMINI FALLBACK
         # ====================================================
 
-        ai_result = generate_ai_response(
-            prompt=prompt,
-            system_instruction=instructions,
-            temperature=0.2
-        )
+        response = None
 
-        answer = ai_result["text"].strip()
+        last_error = None
 
-        used_provider = ai_result["provider"]
-        used_model = ai_result["model"]
+        used_model = None
+
+
+        for model_name in GEMINI_MODELS:
+
+            try:
+
+                print(
+                    f"Trying chatbot model: "
+                    f"{model_name}"
+                )
+
+
+                response = client.models.generate_content(
+
+                    model=model_name,
+
+                    contents=prompt,
+
+                    config=types.GenerateContentConfig(
+
+                        system_instruction=instructions,
+
+                        temperature=0.2
+                    )
+                )
+
+
+                if response and response.text:
+
+                    used_model = model_name
+
+                    print(
+                        "Chatbot succeeded with: "
+                        f"{model_name}"
+                    )
+
+                    break
+
+
+            except Exception as error:
+
+                last_error = error
+
+                print(
+                    f"{model_name} failed "
+                    "for chatbot:"
+                )
+
+                print(error)
+
+                continue
+
+
+        # ====================================================
+        # ALL MODELS FAILED
+        # ====================================================
+
+        if response is None or not response.text:
+
+            if last_error:
+                raise last_error
+
+            raise RuntimeError(
+                "All Gemini models failed."
+            )
+
 
         # ====================================================
         # ANSWER
         # ====================================================
+
+        answer = response.text.strip()
+
 
         if not answer:
 
@@ -1871,8 +1509,6 @@ the study material above.
             "answer": answer,
 
             "language": language,
-
-            "provider": used_provider,
 
             "model": used_model
         })
@@ -2011,23 +1647,6 @@ def generate_pdf_file():
             )
 
         }), 500
-
-
-# ============================================================
-# API 404 HANDLER
-# ============================================================
-
-@app.errorhandler(404)
-def api_not_found(error):
-    if request.path.startswith("/api/"):
-        return jsonify({
-            "success": False,
-            "error": "API endpoint not found.",
-            "path": request.path,
-            "hint": "Redeploy the latest app.py on Vercel and verify /api/chat exists."
-        }), 404
-
-    return error
 
 
 # ============================================================
