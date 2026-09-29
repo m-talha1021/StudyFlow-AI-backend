@@ -80,10 +80,10 @@ GEMINI_MODELS = [
 
 OPENAI_MODELS = [
     "gpt-6-luna",
+    "gpt-5.6-luna",
     "gpt-5.4-mini",
-    "gpt-5.4",
-    "gpt-5.2",
     "gpt-5.1",
+    "gpt-4.1-mini",
 ]
 
 # ============================================================
@@ -407,6 +407,139 @@ def clean_generated_result(text):
 
 
     return text.strip()
+
+
+# ============================================================
+# AI TEXT GENERATION WITH AUTOMATIC FALLBACK
+# ============================================================
+
+def generate_ai_response(
+    prompt,
+    system_instruction=None,
+    temperature=0.2
+):
+    """
+    Generate a text response using Gemini first.
+
+    If every configured Gemini model fails, automatically try
+    the configured OpenAI models in order.
+
+    Returns a dictionary containing the generated text, provider
+    and model that actually produced the response.
+    """
+
+    last_error = None
+
+    # --------------------------------------------------------
+    # 1. TRY GEMINI MODELS
+    # --------------------------------------------------------
+
+    for model_name in GEMINI_MODELS:
+
+        try:
+
+            print(
+                f"[AI] Trying Gemini model: {model_name}"
+            )
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=temperature
+                )
+            )
+
+            if response and response.text:
+
+                print(
+                    f"[AI] Gemini succeeded: {model_name}"
+                )
+
+                return {
+                    "text": response.text,
+                    "provider": "Gemini",
+                    "model": model_name
+                }
+
+        except Exception as error:
+
+            last_error = error
+
+            print(
+                f"[AI] Gemini failed: {model_name}"
+            )
+            print(error)
+
+            continue
+
+    # --------------------------------------------------------
+    # 2. GEMINI FAILED → TRY OPENAI MODELS
+    # --------------------------------------------------------
+
+    if openai_client is not None:
+
+        for model_name in OPENAI_MODELS:
+
+            try:
+
+                print(
+                    f"[AI] Trying OpenAI model: {model_name}"
+                )
+
+                request_args = {
+                    "model": model_name,
+                    "input": prompt
+                }
+
+                if system_instruction:
+                    request_args["instructions"] = system_instruction
+
+                response = openai_client.responses.create(
+                    **request_args
+                )
+
+                if response and response.output_text:
+
+                    print(
+                        f"[AI] OpenAI succeeded: {model_name}"
+                    )
+
+                    return {
+                        "text": response.output_text,
+                        "provider": "OpenAI",
+                        "model": model_name
+                    }
+
+            except Exception as error:
+
+                last_error = error
+
+                print(
+                    f"[AI] OpenAI failed: {model_name}"
+                )
+                print(error)
+
+                continue
+
+    else:
+
+        print(
+            "[AI] OPENAI_API_KEY is not configured; "
+            "skipping OpenAI fallback."
+        )
+
+    # --------------------------------------------------------
+    # 3. ALL TEXT MODELS FAILED
+    # --------------------------------------------------------
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError(
+        "All configured AI models are currently unavailable."
+    )
 
 
 # ============================================================
@@ -1106,75 +1239,19 @@ Follow the language instructions exactly.
 
 
         # ====================================================
-        # GEMINI FALLBACK
+        # AI GENERATION WITH GEMINI → OPENAI FALLBACK
         # ====================================================
 
-        response = None
+        ai_result = generate_ai_response(
+            prompt=prompt,
+            system_instruction=instructions,
+            temperature=0.2
+        )
 
-        last_error = None
+        result = ai_result["text"].strip()
 
-        used_model = None
-
-
-        for model_name in GEMINI_MODELS:
-
-            try:
-
-                print(
-                    f"Trying Gemini model: "
-                    f"{model_name}"
-                )
-
-
-                response = client.models.generate_content(
-
-                    model=model_name,
-
-                    contents=prompt,
-
-                    config=types.GenerateContentConfig(
-
-                        system_instruction=instructions,
-
-                        temperature=0.2
-                    )
-                )
-
-
-                if response and response.text:
-
-                    used_model = model_name
-
-                    print(
-                        "Success with Gemini model: "
-                        f"{model_name}"
-                    )
-
-                    break
-
-
-            except Exception as error:
-
-                last_error = error
-
-                print(
-                    f"{model_name} failed:"
-                )
-
-                print(error)
-
-                continue
-
-
-        if response is None or not response.text:
-
-            if last_error:
-                raise last_error
-
-            raise RuntimeError(
-                "All Gemini models failed."
-            )
-
+        used_provider = ai_result["provider"]
+        used_model = ai_result["model"]
 
         # ====================================================
         # RESULT
@@ -1204,6 +1281,8 @@ Follow the language instructions exactly.
             "mode": mode,
 
             "language": language,
+
+            "provider": used_provider,
 
             "model": used_model,
 
@@ -1530,87 +1609,23 @@ the study material above.
 
 
         # ====================================================
-        # GEMINI FALLBACK
+        # AI CHAT WITH GEMINI → OPENAI FALLBACK
         # ====================================================
 
-        response = None
+        ai_result = generate_ai_response(
+            prompt=prompt,
+            system_instruction=instructions,
+            temperature=0.2
+        )
 
-        last_error = None
+        answer = ai_result["text"].strip()
 
-        used_model = None
-
-
-        for model_name in GEMINI_MODELS:
-
-            try:
-
-                print(
-                    f"Trying chatbot model: "
-                    f"{model_name}"
-                )
-
-
-                response = client.models.generate_content(
-
-                    model=model_name,
-
-                    contents=prompt,
-
-                    config=types.GenerateContentConfig(
-
-                        system_instruction=instructions,
-
-                        temperature=0.2
-                    )
-                )
-
-
-                if response and response.text:
-
-                    used_model = model_name
-
-                    print(
-                        "Chatbot succeeded with: "
-                        f"{model_name}"
-                    )
-
-                    break
-
-
-            except Exception as error:
-
-                last_error = error
-
-                print(
-                    f"{model_name} failed "
-                    "for chatbot:"
-                )
-
-                print(error)
-
-                continue
-
-
-        # ====================================================
-        # ALL MODELS FAILED
-        # ====================================================
-
-        if response is None or not response.text:
-
-            if last_error:
-                raise last_error
-
-            raise RuntimeError(
-                "All Gemini models failed."
-            )
-
+        used_provider = ai_result["provider"]
+        used_model = ai_result["model"]
 
         # ====================================================
         # ANSWER
         # ====================================================
-
-        answer = response.text.strip()
-
 
         if not answer:
 
@@ -1637,6 +1652,8 @@ the study material above.
             "answer": answer,
 
             "language": language,
+
+            "provider": used_provider,
 
             "model": used_model
         })
