@@ -80,10 +80,10 @@ GEMINI_MODELS = [
 
 OPENAI_MODELS = [
     "gpt-6-luna",
+    "gpt-5.6-luna",
     "gpt-5.4-mini",
-    "gpt-5.4",
-    "gpt-5.2",
     "gpt-5.1",
+    "gpt-4.1-mini",
 ]
 
 # ============================================================
@@ -410,6 +410,139 @@ def clean_generated_result(text):
 
 
 # ============================================================
+# AI TEXT GENERATION WITH AUTOMATIC FALLBACK
+# ============================================================
+
+def generate_ai_response(
+    prompt,
+    system_instruction=None,
+    temperature=0.2
+):
+    """
+    Generate a text response using Gemini first.
+
+    If every configured Gemini model fails, automatically try
+    the configured OpenAI models in order.
+
+    Returns a dictionary containing the generated text, provider
+    and model that actually produced the response.
+    """
+
+    last_error = None
+
+    # --------------------------------------------------------
+    # 1. TRY GEMINI MODELS
+    # --------------------------------------------------------
+
+    for model_name in GEMINI_MODELS:
+
+        try:
+
+            print(
+                f"[AI] Trying Gemini model: {model_name}"
+            )
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=temperature
+                )
+            )
+
+            if response and response.text:
+
+                print(
+                    f"[AI] Gemini succeeded: {model_name}"
+                )
+
+                return {
+                    "text": response.text,
+                    "provider": "Gemini",
+                    "model": model_name
+                }
+
+        except Exception as error:
+
+            last_error = error
+
+            print(
+                f"[AI] Gemini failed: {model_name}"
+            )
+            print(error)
+
+            continue
+
+    # --------------------------------------------------------
+    # 2. GEMINI FAILED → TRY OPENAI MODELS
+    # --------------------------------------------------------
+
+    if openai_client is not None:
+
+        for model_name in OPENAI_MODELS:
+
+            try:
+
+                print(
+                    f"[AI] Trying OpenAI model: {model_name}"
+                )
+
+                request_args = {
+                    "model": model_name,
+                    "input": prompt
+                }
+
+                if system_instruction:
+                    request_args["instructions"] = system_instruction
+
+                response = openai_client.responses.create(
+                    **request_args
+                )
+
+                if response and response.output_text:
+
+                    print(
+                        f"[AI] OpenAI succeeded: {model_name}"
+                    )
+
+                    return {
+                        "text": response.output_text,
+                        "provider": "OpenAI",
+                        "model": model_name
+                    }
+
+            except Exception as error:
+
+                last_error = error
+
+                print(
+                    f"[AI] OpenAI failed: {model_name}"
+                )
+                print(error)
+
+                continue
+
+    else:
+
+        print(
+            "[AI] OPENAI_API_KEY is not configured; "
+            "skipping OpenAI fallback."
+        )
+
+    # --------------------------------------------------------
+    # 3. ALL TEXT MODELS FAILED
+    # --------------------------------------------------------
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError(
+        "All configured AI models are currently unavailable."
+    )
+
+
+# ============================================================
 # HOME
 # ============================================================
 
@@ -457,184 +590,159 @@ def process_material():
 
 
         # ====================================================
-        # MULTIPLE FILE UPLOAD
+        # FILE UPLOAD
         # ====================================================
 
-        uploaded_files = request.files.getlist("files")
+        if "file" in request.files:
 
-        # Keep the old "file" field working for older frontend builds.
-        if not uploaded_files:
-            uploaded_files = request.files.getlist("file")
+            file = request.files["file"]
 
-        if uploaded_files:
+            if file.filename == "":
 
-            MAX_FILES = 10
+                return jsonify({
+                    "success": False,
+                    "error":
+                        "No file was selected."
+                }), 400
 
-            if len(uploaded_files) > MAX_FILES:
+
+            filename = file.filename
+
+            extension = filename.rsplit(
+                ".",
+                1
+            )[-1].lower()
+
+
+            if extension not in ALLOWED_EXTENSIONS:
 
                 return jsonify({
                     "success": False,
                     "error": (
-                        f"You can upload up to {MAX_FILES} files at a time."
+                        "Supported files are "
+                        "PDF, DOCX, PPTX, PNG, JPG, "
+                        "JPEG, WEBP, HEIC and HEIF."
                     )
                 }), 400
 
-            extracted_parts = []
-            processed_filenames = []
 
-            for file in uploaded_files:
+            # Read file
 
-                if not file or not file.filename:
+            file_bytes = file.read()
 
-                    return jsonify({
-                        "success": False,
-                        "error": "One of the selected files has no filename."
-                    }), 400
 
-                filename = file.filename
+            if not file_bytes:
 
-                extension = filename.rsplit(
-                    ".",
-                    1
-                )[-1].lower()
+                return jsonify({
+                    "success": False,
+                    "error":
+                        "The uploaded file is empty."
+                }), 400
 
-                if extension not in ALLOWED_EXTENSIONS:
+
+            # =================================================
+            # IMAGE
+            # =================================================
+
+            if extension in IMAGE_MIME_TYPES:
+
+                if len(file_bytes) > MAX_IMAGE_SIZE:
 
                     return jsonify({
                         "success": False,
                         "error": (
-                            f"Unsupported file type for '{filename}'. "
-                            "Supported files are PDF, DOCX, PPTX, PNG, JPG, "
-                            "JPEG, WEBP, HEIC and HEIF."
+                            "Image is too large. "
+                            "Please upload an image "
+                            "smaller than 15 MB."
                         )
                     }), 400
 
-                file_bytes = file.read()
 
-                if not file_bytes:
+                mime_type = IMAGE_MIME_TYPES[
+                    extension
+                ]
 
-                    return jsonify({
-                        "success": False,
-                        "error": f"The uploaded file '{filename}' is empty."
-                    }), 400
 
-                try:
+                print(
+                    f"Processing image: {filename}"
+                )
 
-                    # =================================================
-                    # IMAGE
-                    # =================================================
 
-                    if extension in IMAGE_MIME_TYPES:
+                image_text = ""
 
-                        if len(file_bytes) > MAX_IMAGE_SIZE:
+                last_image_error = None
 
-                            return jsonify({
-                                "success": False,
-                                "error": (
-                                    f"Image '{filename}' is too large. "
-                                    "Please upload an image smaller than 15 MB."
-                                )
-                            }), 400
 
-                        mime_type = IMAGE_MIME_TYPES[extension]
+                for model_name in GEMINI_MODELS:
+
+                    try:
 
                         print(
-                            f"Processing image: {filename}"
+                            f"Trying image model: "
+                            f"{model_name}"
                         )
 
-                        image_text = ""
-                        last_image_error = None
 
-                        for model_name in GEMINI_MODELS:
+                        image_text = extract_image_text(
+                            image_bytes=file_bytes,
+                            mime_type=mime_type,
+                            client=client,
+                            model_name=model_name
+                        )
 
-                            try:
 
-                                print(
-                                    f"Trying image model: {model_name} "
-                                    f"for {filename}"
-                                )
+                        if image_text:
 
-                                image_text = extract_image_text(
-                                    image_bytes=file_bytes,
-                                    mime_type=mime_type,
-                                    client=client,
-                                    model_name=model_name
-                                )
-
-                                if image_text:
-                                    print(
-                                        "Image processing succeeded with: "
-                                        f"{model_name} for {filename}"
-                                    )
-                                    break
-
-                            except Exception as error:
-
-                                last_image_error = error
-
-                                print(
-                                    f"{model_name} failed for image "
-                                    f"'{filename}':"
-                                )
-
-                                print(error)
-
-                        if not image_text:
-
-                            if last_image_error:
-                                raise last_image_error
-
-                            raise RuntimeError(
-                                "Could not extract readable study content "
-                                f"from image '{filename}'."
+                            print(
+                                "Image processing "
+                                "succeeded with: "
+                                f"{model_name}"
                             )
 
-                        extracted_parts.append(
-                            f"===== FILE: {filename} =====\n\n{image_text.strip()}"
+                            break
+
+
+                    except Exception as error:
+
+                        last_image_error = error
+
+                        print(
+                            f"{model_name} failed "
+                            "for image processing:"
                         )
 
-                    # =================================================
-                    # PDF / DOCX / PPTX
-                    # =================================================
+                        print(error)
 
-                    else:
 
-                        document_text = extract_text(
-                            file_bytes,
-                            filename
-                        )
+                if not image_text:
 
-                        if not document_text or not document_text.strip():
-                            raise RuntimeError(
-                                f"No readable text was found in '{filename}'."
-                            )
+                    if last_image_error:
+                        raise last_image_error
 
-                        extracted_parts.append(
-                            f"===== FILE: {filename} =====\n\n"
-                            f"{document_text.strip()}"
-                        )
-
-                    processed_filenames.append(filename)
-
-                except Exception as file_error:
-
-                    print(
-                        f"Failed processing '{filename}':",
-                        file_error
+                    raise RuntimeError(
+                        "Could not extract readable "
+                        "study content from the image."
                     )
 
-                    return jsonify({
-                        "success": False,
-                        "error": (
-                            f"Could not process '{filename}'. "
-                            f"{str(file_error)}"
-                        )
-                    }), 500
 
-            # Combine every uploaded file into one study knowledge base.
-            text = "\n\n".join(extracted_parts).strip()
-            filename = ", ".join(processed_filenames)
-            source = "files"
+                text = image_text
+
+                source = "image"
+
+
+            # =================================================
+            # PDF / DOCX / PPTX
+            # =================================================
+
+            else:
+
+                text = extract_text(
+                    file_bytes,
+                    filename
+                )
+
+                source = "file"
+
 
         # ====================================================
         # PASTED TEXT
@@ -755,10 +863,6 @@ def process_material():
             "source": source,
 
             "filename": filename,
-
-            "files": processed_filenames if uploaded_files else [],
-
-            "file_count": len(processed_filenames) if uploaded_files else 0,
 
             "characters": len(text),
 
@@ -1135,89 +1239,30 @@ Follow the language instructions exactly.
 
 
         # ====================================================
-        # GEMINI FALLBACK
+        # AI GENERATION WITH GEMINI → OPENAI FALLBACK
         # ====================================================
 
-        response = None
+        ai_result = generate_ai_response(
+            prompt=prompt,
+            system_instruction=instructions,
+            temperature=0.2
+        )
 
-        last_error = None
+        result = ai_result["text"].strip()
 
-        used_model = None
-
-
-        for model_name in GEMINI_MODELS:
-
-            try:
-
-                print(
-                    f"Trying Gemini model: "
-                    f"{model_name}"
-                )
-
-
-                response = client.models.generate_content(
-
-                    model=model_name,
-
-                    contents=prompt,
-
-                    config=types.GenerateContentConfig(
-
-                        system_instruction=instructions,
-
-                        temperature=0.2
-                    )
-                )
-
-
-                if response and response.text:
-
-                    used_model = model_name
-
-                    print(
-                        "Success with Gemini model: "
-                        f"{model_name}"
-                    )
-
-                    break
-
-
-            except Exception as error:
-
-                last_error = error
-
-                print(
-                    f"{model_name} failed:"
-                )
-
-                print(error)
-
-                continue
-
-
-        if response is None or not response.text:
-
-            if last_error:
-                raise last_error
-
-            raise RuntimeError(
-                "All Gemini models failed."
-            )
-
+        used_provider = ai_result["provider"]
+        used_model = ai_result["model"]
 
         # ====================================================
         # RESULT
         # ====================================================
-
-        result = response.text.strip()
-
 
         if not result:
 
             return jsonify({
                 "success": False,
                 "error":
-                    "Gemini did not generate a result."
+                    "The AI did not generate a result."
             }), 500
 
 
@@ -1233,6 +1278,8 @@ Follow the language instructions exactly.
             "mode": mode,
 
             "language": language,
+
+            "provider": used_provider,
 
             "model": used_model,
 
@@ -1257,6 +1304,228 @@ Follow the language instructions exactly.
                 f"{str(error)}"
             )
 
+        }), 500
+
+
+
+# ============================================================
+# FLASHCARDS
+# ============================================================
+
+@app.route(
+    "/api/flashcards",
+    methods=["POST"]
+)
+def generate_flashcards():
+    """
+    Generate concise front/back flashcards from the currently
+    processed study material. Uses the same Gemini -> OpenAI
+    fallback chain as the rest of the application.
+    """
+
+    try:
+        data = request.get_json(silent=True) or {}
+
+        try:
+            count = int(data.get("count", 10))
+        except (TypeError, ValueError):
+            count = 10
+
+        # Keep the endpoint predictable and protect token usage.
+        count = max(5, min(count, 20))
+
+        if not material_store["chunks"]:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "Please upload or paste study material first."
+                )
+            }), 400
+
+        language = material_store["language"]
+
+        if language == "arabic":
+            language_rule = """
+Generate every flashcard in Arabic only.
+Do not translate the source material into English.
+"""
+        elif language == "urdu":
+            language_rule = """
+Generate every flashcard in Urdu only.
+Do not translate the source material into English.
+"""
+        elif language == "english":
+            language_rule = """
+Generate every flashcard in English only.
+"""
+        elif language == "mixed":
+            language_rule = """
+Use the same language style as the study material.
+Preserve Urdu, Arabic and English naturally where they
+appear in the source.
+"""
+        else:
+            language_rule = """
+Use the dominant language of the study material.
+Do not unnecessarily translate the source.
+"""
+
+        query = (
+            "Find the most important concepts, definitions, "
+            "facts, processes, relationships and exam-relevant "
+            "ideas that can be converted into flashcards."
+        )
+
+        retrieved = retrieve_chunks(
+            material_store["chunks"],
+            material_store["embeddings"],
+            query,
+            top_k=min(10, max(6, count))
+        )
+
+        context = build_context(retrieved)
+
+        if not context:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "Could not retrieve relevant study material "
+                    "for flashcards."
+                )
+            }), 500
+
+        instructions = f"""
+You are StudyFlow AI, an AI study assistant.
+
+Create exactly {count} flashcards from the provided study
+material.
+
+{language_rule}
+
+IMPORTANT:
+- Use ONLY information supported by the provided context.
+- Do not invent facts.
+- Do not use outside knowledge.
+- Each flashcard must test one important concept.
+- The front must be a concise question or prompt.
+- The back must be a concise, accurate answer.
+- Keep each front and back easy to read.
+- Avoid duplicate cards.
+- Return ONLY valid JSON.
+- Do not use Markdown code fences.
+- Do not add commentary before or after the JSON.
+
+Return exactly this structure:
+
+[
+  {{
+    "front": "Question or prompt",
+    "back": "Short answer"
+  }}
+]
+"""
+
+        prompt = f"""
+Study material context:
+
+--------------------
+
+{context}
+
+--------------------
+
+Detected source language:
+{language}
+
+Generate exactly {count} flashcards.
+Return ONLY the JSON array requested above.
+"""
+
+        ai_result = generate_ai_response(
+            prompt=prompt,
+            system_instruction=instructions,
+            temperature=0.2
+        )
+
+        raw = ai_result["text"].strip()
+
+        # Remove accidental Markdown fences.
+        raw = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            raw,
+            flags=re.IGNORECASE
+        )
+        raw = re.sub(
+            r"\s*```$",
+            "",
+            raw
+        ).strip()
+
+        # Extract the JSON array if a model added a small amount
+        # of surrounding text.
+        start = raw.find("[")
+        end = raw.rfind("]")
+
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError(
+                "The AI returned an invalid flashcard format."
+            )
+
+        json_text = raw[start:end + 1]
+
+        import json
+
+        cards = json.loads(json_text)
+
+        if not isinstance(cards, list):
+            raise ValueError(
+                "The AI did not return a flashcard list."
+            )
+
+        cleaned_cards = []
+
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+
+            front = str(card.get("front", "")).strip()
+            back = str(card.get("back", "")).strip()
+
+            if not front or not back:
+                continue
+
+            cleaned_cards.append({
+                "front": front,
+                "back": back
+            })
+
+            if len(cleaned_cards) >= count:
+                break
+
+        if len(cleaned_cards) < count:
+            raise ValueError(
+                "The AI did not generate enough valid flashcards."
+            )
+
+        return jsonify({
+            "success": True,
+            "cards": cleaned_cards,
+            "count": len(cleaned_cards),
+            "language": language,
+            "provider": ai_result["provider"],
+            "model": ai_result["model"]
+        })
+
+    except Exception as error:
+        print("Flashcards error:", error)
+
+        return jsonify({
+            "success": False,
+            "error": (
+                "Could not generate flashcards. "
+                f"{str(error)}"
+            )
         }), 500
 
 
@@ -1559,87 +1828,23 @@ the study material above.
 
 
         # ====================================================
-        # GEMINI FALLBACK
+        # AI CHAT WITH GEMINI → OPENAI FALLBACK
         # ====================================================
 
-        response = None
+        ai_result = generate_ai_response(
+            prompt=prompt,
+            system_instruction=instructions,
+            temperature=0.2
+        )
 
-        last_error = None
+        answer = ai_result["text"].strip()
 
-        used_model = None
-
-
-        for model_name in GEMINI_MODELS:
-
-            try:
-
-                print(
-                    f"Trying chatbot model: "
-                    f"{model_name}"
-                )
-
-
-                response = client.models.generate_content(
-
-                    model=model_name,
-
-                    contents=prompt,
-
-                    config=types.GenerateContentConfig(
-
-                        system_instruction=instructions,
-
-                        temperature=0.2
-                    )
-                )
-
-
-                if response and response.text:
-
-                    used_model = model_name
-
-                    print(
-                        "Chatbot succeeded with: "
-                        f"{model_name}"
-                    )
-
-                    break
-
-
-            except Exception as error:
-
-                last_error = error
-
-                print(
-                    f"{model_name} failed "
-                    "for chatbot:"
-                )
-
-                print(error)
-
-                continue
-
-
-        # ====================================================
-        # ALL MODELS FAILED
-        # ====================================================
-
-        if response is None or not response.text:
-
-            if last_error:
-                raise last_error
-
-            raise RuntimeError(
-                "All Gemini models failed."
-            )
-
+        used_provider = ai_result["provider"]
+        used_model = ai_result["model"]
 
         # ====================================================
         # ANSWER
         # ====================================================
-
-        answer = response.text.strip()
-
 
         if not answer:
 
@@ -1666,6 +1871,8 @@ the study material above.
             "answer": answer,
 
             "language": language,
+
+            "provider": used_provider,
 
             "model": used_model
         })
