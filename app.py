@@ -6,6 +6,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 
 from google import genai
+from openai import OpenAI
 from google.genai import types
 
 from document_parser import extract_text
@@ -26,14 +27,18 @@ from pdf_generator import generate_pdf
 # ENVIRONMENT
 # ============================================================
 
-load_dotenv()
+# ============================================================
+# API KEYS
+# ============================================================
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 
 if not GEMINI_API_KEY:
     raise RuntimeError(
         "GEMINI_API_KEY is missing. "
-        "Please add it to your .env file."
+        "Please add it to your environment variables."
     )
 
 
@@ -47,6 +52,18 @@ client = genai.Client(
 
 
 # ============================================================
+# OPENAI CLIENT
+# ============================================================
+
+openai_client = None
+
+if OPENAI_API_KEY:
+    openai_client = OpenAI(
+        api_key=OPENAI_API_KEY
+    )
+
+
+# ============================================================
 # GEMINI MODELS
 # ============================================================
 
@@ -56,6 +73,18 @@ GEMINI_MODELS = [
     "gemini-3.5-flash"
 ]
 
+
+# ============================================================
+# OPENAI MODELS
+# ============================================================
+
+OPENAI_MODELS = [
+    "gpt-6-luna",
+    "gpt-5.4-mini",
+    "gpt-5.4",
+    "gpt-5.2",
+    "gpt-5.1",
+]
 
 # ============================================================
 # FLASK APP
