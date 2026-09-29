@@ -1257,15 +1257,12 @@ Follow the language instructions exactly.
         # RESULT
         # ====================================================
 
-        result = response.text.strip()
-
-
         if not result:
 
             return jsonify({
                 "success": False,
                 "error":
-                    "Gemini did not generate a result."
+                    "The AI did not generate a result."
             }), 500
 
 
