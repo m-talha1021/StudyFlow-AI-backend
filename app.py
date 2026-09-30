@@ -1468,6 +1468,203 @@ Return ONLY the JSON array requested above.
 
 
 # ============================================================
+# TEST CONCEPTS
+# TIMED MULTIPLE-CHOICE EXAM FROM STUDY MATERIAL
+# ============================================================
+
+@app.route(
+    "/api/test-concepts",
+    methods=["POST"]
+)
+def generate_test_concepts():
+    """
+    Generate a timed 30-question MCQ exam from the current study material.
+    The frontend handles the timer and scoring so the correct answers are
+    never exposed to the browser until the test is finished.
+    """
+
+    try:
+        data = request.get_json(silent=True) or {}
+
+        try:
+            count = int(data.get("count", 30))
+        except (TypeError, ValueError):
+            count = 30
+
+        count = max(25, min(count, 30))
+
+        if not material_store["chunks"]:
+            return jsonify({
+                "success": False,
+                "error": "Please upload or paste study material first."
+            }), 400
+
+        language = material_store.get("language", "english")
+
+        language_rule = {
+            "arabic": "Generate all questions and options in Arabic.",
+            "urdu": "Generate all questions and options in Urdu.",
+            "english": "Generate all questions and options in English.",
+            "mixed": "Use the dominant language of the study material and preserve important terminology.",
+        }.get(
+            language,
+            "Use the dominant language of the study material."
+        )
+
+        query = (
+            "Find important concepts, definitions, facts, processes, "
+            "relationships and exam-relevant details across the study "
+            "material that can be tested with multiple-choice questions."
+        )
+
+        retrieved = retrieve_chunks(
+            material_store["chunks"],
+            material_store["embeddings"],
+            query,
+            top_k=min(18, max(10, count // 2))
+        )
+
+        context = build_context(retrieved)
+
+        if not context:
+            return jsonify({
+                "success": False,
+                "error": "Could not retrieve study material for the test."
+            }), 500
+
+        instructions = f"""
+You are StudyFlow AI's exam generator.
+
+Create exactly {count} high-quality multiple-choice questions from ONLY
+THE PROVIDED STUDY MATERIAL.
+
+{language_rule}
+
+Rules:
+- Every question must be answerable from the provided material.
+- Do not use outside knowledge.
+- Each question must have exactly four options.
+- Exactly one option must be correct.
+- Avoid duplicate questions.
+- Cover different concepts from the material where possible.
+- Mix conceptual, factual, application and comparison questions when supported.
+- Do not reveal the answer in the question text.
+- Return ONLY valid JSON.
+- Do not use Markdown code fences.
+- Do not add explanations before or after the JSON.
+
+Return exactly this structure:
+[
+  {{
+    "question": "Question text",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "answer": "Option A"
+  }}
+]
+"""
+
+        prompt = f"""
+Study material context:
+
+--------------------
+{context}
+--------------------
+
+Detected source language: {language}
+
+Generate exactly {count} exam questions now.
+Return ONLY the requested JSON array.
+"""
+
+        ai_result = generate_ai_response(
+            prompt=prompt,
+            system_instruction=instructions,
+            temperature=0.25
+        )
+
+        raw = ai_result["text"].strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+
+        start = raw.find("[")
+        end = raw.rfind("]")
+
+        if start == -1 or end <= start:
+            raise ValueError("The AI returned an invalid test format.")
+
+        import json
+        questions = json.loads(raw[start:end + 1])
+
+        if not isinstance(questions, list):
+            raise ValueError("The AI did not return a question list.")
+
+        cleaned_questions = []
+        seen = set()
+
+        for item in questions:
+            if not isinstance(item, dict):
+                continue
+
+            question = str(item.get("question", "")).strip()
+            options = item.get("options", [])
+            answer = str(item.get("answer", "")).strip()
+
+            if not question or not isinstance(options, list) or len(options) != 4:
+                continue
+
+            options = [str(option).strip() for option in options]
+
+            if any(not option for option in options):
+                continue
+
+            if len(set(options)) != 4 or answer not in options:
+                continue
+
+            key = question.casefold()
+            if key in seen:
+                continue
+
+            seen.add(key)
+            cleaned_questions.append({
+                "question": question,
+                "options": options,
+                "answer": answer
+            })
+
+            if len(cleaned_questions) >= count:
+                break
+
+        if len(cleaned_questions) < count:
+            raise ValueError(
+                f"The AI generated only {len(cleaned_questions)} valid questions; {count} are required."
+            )
+
+        # One minute per question gives a predictable exam duration.
+        duration_seconds = count * 60
+
+        return jsonify({
+            "success": True,
+            "questions": cleaned_questions,
+            "count": len(cleaned_questions),
+            "duration_seconds": duration_seconds,
+            "language": language,
+            "provider": ai_result["provider"],
+            "model": ai_result["model"]
+        })
+
+    except Exception as error:
+        print("Test concepts error:", error)
+
+        return jsonify({
+            "success": False,
+            "error": (
+                "Could not generate the Test concepts exam. "
+                f"{str(error)}"
+            )
+        }), 500
+
+
+# ============================================================
 # AI CHATBOT
 # ASK QUESTIONS FROM UPLOADED MATERIAL
 # ============================================================
