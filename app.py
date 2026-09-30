@@ -1,7 +1,5 @@
 import os
 import re
-import json
-from datetime import date, datetime, timedelta
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
@@ -583,10 +581,10 @@ def test_api():
 def process_material():
 
     try:
+
         text = ""
-        source = None
         filenames = []
-        extracted_parts = []
+        source = None
 
         # ====================================================
         # MULTIPLE FILE UPLOAD
@@ -594,7 +592,8 @@ def process_material():
 
         uploaded_files = request.files.getlist("files")
 
-        # Backward compatibility with the previous single-file frontend
+        # Backward compatibility with the previous single-file
+        # frontend, which used the field name "file".
         if not uploaded_files and "file" in request.files:
             uploaded_files = [request.files["file"]]
 
@@ -603,16 +602,23 @@ def process_material():
             if len(uploaded_files) > 10:
                 return jsonify({
                     "success": False,
-                    "error": "You can upload a maximum of 10 files at a time."
+                    "error": "Please upload a maximum of 10 files at a time."
                 }), 400
 
-            for uploaded_file in uploaded_files:
+            extracted_parts = []
 
-                if not uploaded_file or not uploaded_file.filename:
+            for file in uploaded_files:
+
+                if not file or file.filename == "":
                     continue
 
-                filename = uploaded_file.filename
-                extension = filename.rsplit(".", 1)[-1].lower()
+                filename = file.filename
+                filenames.append(filename)
+
+                extension = filename.rsplit(
+                    ".",
+                    1
+                )[-1].lower()
 
                 if extension not in ALLOWED_EXTENSIONS:
                     return jsonify({
@@ -624,15 +630,13 @@ def process_material():
                         )
                     }), 400
 
-                file_bytes = uploaded_file.read()
+                file_bytes = file.read()
 
                 if not file_bytes:
                     return jsonify({
                         "success": False,
                         "error": f"The uploaded file is empty: {filename}."
                     }), 400
-
-                filenames.append(filename)
 
                 # ------------------------------------------------
                 # IMAGE
@@ -650,11 +654,19 @@ def process_material():
                         }), 400
 
                     mime_type = IMAGE_MIME_TYPES[extension]
+
+                    print(f"Processing image: {filename}")
+
                     image_text = ""
                     last_image_error = None
 
                     for model_name in GEMINI_MODELS:
                         try:
+                            print(
+                                f"Trying image model: {model_name} "
+                                f"for {filename}"
+                            )
+
                             image_text = extract_image_text(
                                 image_bytes=file_bytes,
                                 mime_type=mime_type,
@@ -662,21 +674,27 @@ def process_material():
                                 model_name=model_name
                             )
 
-                            if image_text and image_text.strip():
+                            if image_text:
+                                print(
+                                    "Image processing succeeded with: "
+                                    f"{model_name} for {filename}"
+                                )
                                 break
 
                         except Exception as error:
                             last_image_error = error
                             print(
                                 f"{model_name} failed for image "
-                                f"{filename}: {error}"
+                                f"{filename}:"
                             )
+                            print(error)
 
                     if not image_text:
                         if last_image_error:
                             raise last_image_error
                         raise RuntimeError(
-                            f"Could not extract readable study content from {filename}."
+                            f"Could not extract readable study content "
+                            f"from image: {filename}."
                         )
 
                     extracted_parts.append(
@@ -712,10 +730,16 @@ def process_material():
         # ====================================================
 
         else:
-            data = request.get_json(silent=True)
+
+            data = request.get_json(
+                silent=True
+            )
 
             if data:
-                text = data.get("text", "").strip()
+                text = data.get(
+                    "text",
+                    ""
+                ).strip()
                 source = "text"
 
         # ====================================================
@@ -775,7 +799,6 @@ def process_material():
         material_store["language"] = language
         material_store["chunks"] = chunks
         material_store["embeddings"] = embeddings
-        material_store["filenames"] = filenames
 
         # ====================================================
         # RESPONSE
@@ -793,13 +816,17 @@ def process_material():
         })
 
     except Exception as error:
-        print("Material processing error:", error)
+
+        print(
+            "Material processing error:",
+            error
+        )
 
         return jsonify({
             "success": False,
             "error": (
                 "Could not process the study material. "
-                f"Details: {str(error)}"
+                f"{str(error)}"
             )
         }), 500
 
@@ -1217,323 +1244,6 @@ Follow the language instructions exactly.
 
         }), 500
 
-
-
-# ============================================================
-# AI STUDY PLANNER
-# ============================================================
-
-@app.route(
-    "/api/study-plan",
-    methods=["POST"]
-)
-def generate_study_plan():
-    """
-    Create a personalized study schedule from the currently
-    processed material, exam date, available daily study time,
-    and preferred study days per week.
-    """
-
-    try:
-        data = request.get_json(silent=True) or {}
-
-        exam_date_text = str(
-            data.get("exam_date", "")
-        ).strip()
-
-        if not exam_date_text:
-            return jsonify({
-                "success": False,
-                "error": "Please provide your exam date."
-            }), 400
-
-        try:
-            exam_date = datetime.strptime(
-                exam_date_text,
-                "%Y-%m-%d"
-            ).date()
-        except ValueError:
-            return jsonify({
-                "success": False,
-                "error": "Exam date must use YYYY-MM-DD format."
-            }), 400
-
-        today = date.today()
-        days_remaining = (exam_date - today).days
-
-        if days_remaining < 1:
-            return jsonify({
-                "success": False,
-                "error": "Please choose an exam date at least one day in the future."
-            }), 400
-
-        if days_remaining > 180:
-            return jsonify({
-                "success": False,
-                "error": "Please choose an exam date within the next 180 days."
-            }), 400
-
-        try:
-            hours_per_day = float(
-                data.get("hours_per_day", 2)
-            )
-        except (TypeError, ValueError):
-            hours_per_day = 2
-
-        try:
-            study_days_per_week = int(
-                data.get("study_days_per_week", 6)
-            )
-        except (TypeError, ValueError):
-            study_days_per_week = 6
-
-        hours_per_day = max(0.5, min(hours_per_day, 12))
-        study_days_per_week = max(1, min(study_days_per_week, 7))
-
-        goal = str(
-            data.get("goal", "Prepare thoroughly for my exam")
-        ).strip()[:500]
-
-        if not material_store["chunks"]:
-            return jsonify({
-                "success": False,
-                "error": "Please upload or paste study material first."
-            }), 400
-
-        language = material_store["language"]
-
-        if language == "arabic":
-            language_rule = "Generate the plan in Arabic only."
-        elif language == "urdu":
-            language_rule = "Generate the plan in Urdu only."
-        elif language == "english":
-            language_rule = "Generate the plan in English only."
-        elif language == "mixed":
-            language_rule = (
-                "Use the same language style as the study material and "
-                "preserve Urdu, Arabic and English terms naturally."
-            )
-        else:
-            language_rule = "Use the dominant language of the study material."
-
-        query = (
-            "Identify all important chapters, topics, concepts, definitions, "
-            "processes, difficult areas and exam-relevant material that should "
-            "be studied and reviewed before an exam."
-        )
-
-        retrieved = retrieve_chunks(
-            material_store["chunks"],
-            material_store["embeddings"],
-            query,
-            top_k=min(12, max(8, len(material_store["chunks"])))
-        )
-
-        context = build_context(retrieved)
-
-        if not context:
-            return jsonify({
-                "success": False,
-                "error": "Could not retrieve relevant study material for the plan."
-            }), 500
-
-        # Build the exact dates available to the planner. The model receives
-        # these dates so it does not invent calendar dates.
-        available_dates = []
-        cursor = today + timedelta(days=1)
-
-        while cursor <= exam_date:
-            available_dates.append(cursor.isoformat())
-            cursor += timedelta(days=1)
-
-        available_dates_text = ", ".join(available_dates)
-
-        total_study_hours = round(
-            days_remaining * hours_per_day * (study_days_per_week / 7),
-            1
-        )
-
-        instructions = f"""
-You are StudyFlow AI, an intelligent academic study planner.
-
-Create a practical personalized study plan using ONLY the provided study
-material.
-
-{language_rule}
-
-STUDENT SETTINGS:
-- Exam date: {exam_date_text}
-- Days remaining: {days_remaining}
-- Study time: {hours_per_day} hours per study day
-- Preferred study days: {study_days_per_week} days per week
-- Goal: {goal or 'Prepare thoroughly for the exam'}
-
-PLANNING RULES:
-- Cover the important topics in the supplied study material.
-- Prioritize difficult and high-value concepts before the exam.
-- Include review and active-recall sessions.
-- Include lighter review near the exam rather than introducing large new topics at the last minute.
-- Respect the student's available daily hours.
-- Use only dates from the supplied date list.
-- Do not invent topics that are absent from the material.
-- Avoid assigning study work to more than the requested number of days per week.
-- Keep each day's workload realistic.
-- Return ONLY valid JSON. No Markdown fences and no commentary.
-
-AVAILABLE DATES:
-{available_dates_text}
-
-Return exactly this JSON structure:
-{{
-  "title": "Personalized Study Plan",
-  "overview": "Short overview of the strategy",
-  "days_remaining": {days_remaining},
-  "exam_date": "{exam_date_text}",
-  "hours_per_day": {hours_per_day},
-  "study_days_per_week": {study_days_per_week},
-  "total_study_hours": {total_study_hours},
-  "days": [
-    {{
-      "day": 1,
-      "date": "YYYY-MM-DD",
-      "focus": "Topic or focus for the day",
-      "total_minutes": 120,
-      "tasks": [
-        {{"task": "Study a specific topic", "duration": 60}},
-        {{"task": "Practice active recall", "duration": 30}},
-        {{"task": "Review previous material", "duration": 30}}
-      ],
-      "review": "Short review instruction"
-    }}
-  ]
-}}
-
-Create one plan entry for each selected study day and make sure the final
-entry is on or before the exam date.
-"""
-
-        prompt = f"""
-STUDY MATERIAL:
-
-----------------------------
-{context}
-----------------------------
-
-Create the student's personalized study plan now.
-"""
-
-        ai_result = generate_ai_response(
-            prompt=prompt,
-            system_instruction=instructions,
-            temperature=0.2
-        )
-
-        raw = ai_result["text"].strip()
-        raw = re.sub(
-            r"^```(?:json)?\s*",
-            "",
-            raw,
-            flags=re.IGNORECASE
-        )
-        raw = re.sub(r"\s*```$", "", raw).strip()
-
-        start = raw.find("{")
-        end = raw.rfind("}")
-
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError("The AI returned an invalid study plan format.")
-
-        plan = json.loads(raw[start:end + 1])
-
-        if not isinstance(plan, dict) or not isinstance(plan.get("days"), list):
-            raise ValueError("The AI did not return a valid study plan.")
-
-        # Validate dates and normalize the structure before sending it to the UI.
-        valid_dates = set(available_dates)
-        cleaned_days = []
-
-        for index, day in enumerate(plan["days"]):
-            if not isinstance(day, dict):
-                continue
-
-            day_date = str(day.get("date", "")).strip()
-            if day_date not in valid_dates:
-                continue
-
-            tasks = []
-            for task in day.get("tasks", []):
-                if not isinstance(task, dict):
-                    continue
-
-                task_name = str(task.get("task", "")).strip()
-                try:
-                    duration = int(task.get("duration", 30))
-                except (TypeError, ValueError):
-                    duration = 30
-
-                duration = max(10, min(duration, int(hours_per_day * 60)))
-
-                if task_name:
-                    tasks.append({
-                        "task": task_name,
-                        "duration": duration
-                    })
-
-            if not tasks:
-                continue
-
-            try:
-                total_minutes = int(day.get("total_minutes", sum(
-                    task["duration"] for task in tasks
-                )))
-            except (TypeError, ValueError):
-                total_minutes = sum(task["duration"] for task in tasks)
-
-            total_minutes = min(
-                total_minutes,
-                int(hours_per_day * 60)
-            )
-
-            cleaned_days.append({
-                "day": len(cleaned_days) + 1,
-                "date": day_date,
-                "focus": str(day.get("focus", "Study and review")).strip(),
-                "total_minutes": total_minutes,
-                "tasks": tasks,
-                "review": str(day.get("review", "Review key points before finishing.")).strip()
-            })
-
-        if not cleaned_days:
-            raise ValueError("The AI did not generate usable study-plan days.")
-
-        # Never allow a malformed model response to exceed the actual date range.
-        plan["days"] = cleaned_days
-        plan["title"] = str(plan.get("title", "Personalized Study Plan")).strip()
-        plan["overview"] = str(plan.get("overview", "A personalized plan based on your material.")).strip()
-        plan["days_remaining"] = days_remaining
-        plan["exam_date"] = exam_date_text
-        plan["hours_per_day"] = hours_per_day
-        plan["study_days_per_week"] = study_days_per_week
-        plan["total_study_hours"] = total_study_hours
-
-        return jsonify({
-            "success": True,
-            "plan": plan,
-            "language": language,
-            "provider": ai_result["provider"],
-            "model": ai_result["model"]
-        })
-
-    except Exception as error:
-        print("Study planner error:", error)
-
-        return jsonify({
-            "success": False,
-            "error": (
-                "Could not create the study plan. "
-                f"{str(error)}"
-            )
-        }), 500
 
 
 # ============================================================
