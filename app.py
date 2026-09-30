@@ -96,16 +96,44 @@ app = Flask(__name__)
 # CORS / VERCEL FRONTEND
 # ============================================================
 
-ALLOWED_ORIGINS = {
-    "https://study-flow-ai-lac.vercel.app",
-    "https://www.study-flow-ai-lac.vercel.app",
+# Production frontend plus Vercel preview deployments.
+# You can override these with FRONTEND_ORIGINS in Vercel, using
+# comma-separated origins, for example:
+# https://study-flow-ai-lac.vercel.app,http://localhost:5173
+FRONTEND_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS",
+        "https://study-flow-ai-lac.vercel.app,http://localhost:5173"
+    ).split(",")
+    if origin.strip()
 }
+
+# The current Vercel preview URL pattern is also accepted. This is kept
+# narrow to this project rather than enabling CORS for every Vercel app.
+VERCEL_PREVIEW_ORIGIN_PATTERN = re.compile(
+    r"^https://study-flow-in597ve4c-muhammad-talhas-projects-[a-z0-9-]+\.vercel\.app$",
+    re.IGNORECASE
+)
+
+
+def is_allowed_origin(origin):
+    if not origin:
+        return False
+
+    normalized = origin.rstrip("/")
+
+    if normalized in FRONTEND_ORIGINS:
+        return True
+
+    return bool(VERCEL_PREVIEW_ORIGIN_PATTERN.fullmatch(normalized))
+
 
 CORS(
     app,
     resources={
         r"/api/*": {
-            "origins": list(ALLOWED_ORIGINS),
+            "origins": [*FRONTEND_ORIGINS, VERCEL_PREVIEW_ORIGIN_PATTERN],
             "methods": ["GET", "POST", "OPTIONS"],
             "allow_headers": ["Content-Type", "Authorization"],
             "expose_headers": ["Content-Disposition"],
@@ -128,8 +156,8 @@ def add_cors_headers(response):
     # display the real backend error instead of hiding it as CORS.
     origin = request.headers.get("Origin")
 
-    if origin in ALLOWED_ORIGINS:
-        response.headers["Access-Control-Allow-Origin"] = origin
+    if is_allowed_origin(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin.rstrip("/")
         response.headers["Vary"] = "Origin"
         response.headers["Access-Control-Allow-Methods"] = (
             "GET, POST, OPTIONS"
@@ -552,7 +580,7 @@ def home():
     return jsonify({
         "success": True,
         "message":
-            "StudyFlow AI Gemini backend is running!"
+            "StudyFlow AI backend is running!"
     })
 
 
@@ -567,6 +595,29 @@ def test_api():
         "success": True,
         "message":
             "Hello from the StudyFlow AI backend!"
+    })
+
+
+# ============================================================
+# AUTH / CORS DIAGNOSTIC
+# ============================================================
+
+@app.route("/api/auth/status", methods=["GET", "OPTIONS"])
+def auth_status():
+    """
+    Authentication is handled by Firebase on the frontend.
+    This endpoint is intentionally diagnostic only; it does not
+    create or store passwords.
+    """
+
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    return jsonify({
+        "success": True,
+        "authentication": "Firebase Authentication",
+        "backend_auth_required": False,
+        "message": "Login and signup are handled by Firebase on the frontend."
     })
 
 
