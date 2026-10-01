@@ -1538,11 +1538,11 @@ def generate_test_concepts():
         data = request.get_json(silent=True) or {}
 
         try:
-            count = int(data.get("count", 30))
+            count = int(data.get("count", 20))
         except (TypeError, ValueError):
-            count = 30
+            count = 20
 
-        count = max(25, min(count, 30))
+        count = max(20, min(count, 20))
 
         if not material_store["chunks"]:
             return jsonify({
