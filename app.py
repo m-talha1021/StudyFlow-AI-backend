@@ -2208,47 +2208,234 @@ def generate_pdf_file():
 @app.route("/api/oral-exam", methods=["POST"])
 def oral_exam():
     """Voice-only oral exam. The hidden reference answer stays server-side."""
+    import json
+    import uuid
+
+    def parse_json(raw):
+        """Parse a JSON object returned by an AI provider safely."""
+        if isinstance(raw, dict):
+            parsed = raw
+        else:
+            if not isinstance(raw, str):
+                raise ValueError("The AI returned an unexpected response type.")
+
+            cleaned = raw.strip()
+            cleaned = re.sub(
+                r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE
+            )
+            cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+            first_brace = cleaned.find("{")
+            last_brace = cleaned.rfind("}")
+            if first_brace < 0 or last_brace <= first_brace:
+                raise ValueError("The AI returned an invalid oral-exam format.")
+
+            parsed = json.loads(cleaned[first_brace:last_brace + 1])
+
+        if not isinstance(parsed, dict):
+            raise ValueError("The AI response must be a JSON object.")
+        return parsed
+
+    def oral_context(query):
+        """Retrieve relevant chunks before formatting context for the model."""
+        chunks = material_store.get("chunks") or []
+        if not chunks:
+            raise ValueError("Please upload or paste study material first.")
+
+        embeddings = material_store.get("embeddings") or []
+        retrieved = retrieve_chunks(
+            chunks,
+            embeddings,
+            query,
+            top_k=min(10, len(chunks))
+        )
+        return build_context(retrieved)
+
     try:
-        import uuid, json
-        data=request.get_json(silent=True) or {}
-        action=str(data.get("action","start")).strip().lower()
-        if not material_store["chunks"]:
-            return jsonify({"success":False,"error":"Please upload or paste study material first."}),400
-        language=material_store.get("language","english")
-        total_questions=10
-        language_rule={"urdu":"Ask and evaluate in Urdu only.","arabic":"Ask and evaluate in Arabic only.","english":"Ask and evaluate in English only.","mixed":"Use the same natural language style as the study material."}.get(language,"Use the dominant language of the study material.")
-        def parse_json(raw):
-            raw=re.sub(r"^```(?:json)?\s*","",raw,flags=re.I); raw=re.sub(r"\s*```$","",raw).strip(); a=raw.find("{"); b=raw.rfind("}")
-            if a<0 or b<=a: raise ValueError("The AI returned an invalid oral-exam format.")
-            return json.loads(raw[a:b+1])
-        if action=="start":
-            sid=str(uuid.uuid4()); context=build_context(retrieve_chunks(material_store["chunks"],material_store["embeddings"],"Find important concepts definitions facts processes and exam-relevant ideas for short oral questions.",top_k=min(10,len(material_store["chunks"]))))
-            instructions=f"""You are StudyFlow AI conducting a short oral exam.\n{language_rule}\nCreate ONE short clear oral question from the provided study material. Use ONLY the material. Do not use outside knowledge. Return ONLY JSON: {{"question":"short question","reference_answer":"short correct answer"}}"""''
-            ai=generate_ai_response(prompt=f"STUDY MATERIAL:\n{context}\n\nGenerate the first oral-exam question.",system_instruction=instructions,temperature=.2); item=parse_json(ai["text"]); q=str(item.get("question","")).strip(); ref=str(item.get("reference_answer","")).strip()
-            if not q or not ref: raise ValueError("The AI did not return a valid oral-exam question.")
-            oral_exam_sessions[sid]={"language":language,"question_number":1,"total_questions":total_questions,"score":0,"question":q,"reference_answer":ref}
-            return jsonify({"success":True,"session_id":sid,"question":q,"question_number":1,"total_questions":total_questions,"language":language})
-        if action!="evaluate": return jsonify({"success":False,"error":"Invalid oral-exam action."}),400
-        sid=str(data.get("session_id","")).strip(); answer=str(data.get("answer","")).strip(); session=oral_exam_sessions.get(sid)
-        if not session: return jsonify({"success":False,"error":"The oral-exam session has expired. Please start a new test."}),400
-        if not answer: return jsonify({"success":False,"error":"No spoken answer was detected."}),400
-        context=build_context(material_store["chunks"])
-        instructions=f"""You are evaluating a student's spoken answer in an oral exam.\n{language_rule}\nUse ONLY the study material. Compare the student's answer with the reference answer and accept different wording when meaning is correct. Return ONLY JSON: {{"correct":true,"feedback":"Very short feedback starting with Correct or Incorrect.","score":1}}. score must be 1 or 0. Do not punish minor transcription or grammar differences when meaning is correct."""''
-        prompt=f"STUDY MATERIAL:\n{context}\n\nQUESTION:\n{session['question']}\n\nREFERENCE ANSWER:\n{session['reference_answer']}\n\nSTUDENT SPOKEN ANSWER:\n{answer}"
-        ev=parse_json(generate_ai_response(prompt=prompt,system_instruction=instructions,temperature=.1)["text"]); correct=bool(ev.get("correct",False)); session["score"]+=1 if correct else 0; feedback=str(ev.get("feedback","Correct." if correct else "Incorrect.")).strip(); n=session["question_number"]
-        if n>=session["total_questions"]:
-            score=session["score"]; total=session["total_questions"]; oral_exam_sessions.pop(sid,None)
-            return jsonify({"success":True,"completed":True,"correct":correct,"feedback":feedback,"score":score,"total_questions":total,"final_message":f"Oral test complete. You scored {score} out of {total}."})
-        nextn=n+1; context=build_context(retrieve_chunks(material_store["chunks"],material_store["embeddings"],"Find another important concept or fact for a short oral question.",top_k=min(10,len(material_store["chunks"]))))
-        ni=f"""You are StudyFlow AI conducting an oral exam.\n{language_rule}\nGenerate ONE short oral question from the study material, different from the previous question. Use ONLY the material. Return ONLY JSON: {{"question":"short question","reference_answer":"short correct answer"}}"""''
-        ni_prompt=f"STUDY MATERIAL:\n{context}\n\nPREVIOUS QUESTION:\n{session['question']}\n\nGenerate the next oral question."
-        item=parse_json(generate_ai_response(prompt=ni_prompt,system_instruction=ni,temperature=.2)["text"]); nq=str(item.get("question","")).strip(); nr=str(item.get("reference_answer","")).strip()
-        if not nq or not nr: raise ValueError("The AI did not return a valid next oral question.")
-        session.update(question_number=nextn,question=nq,reference_answer=nr)
-        return jsonify({"success":True,"completed":False,"correct":correct,"feedback":feedback,"score":session["score"],"question_number":nextn,"total_questions":session["total_questions"],"next_question":nq,"language":session["language"]})
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({
+                "success": False,
+                "error": "Invalid request body. Expected a JSON object."
+            }), 400
+
+        action = str(data.get("action", "start")).strip().lower()
+
+        if not material_store.get("chunks"):
+            return jsonify({
+                "success": False,
+                "error": "Please upload or paste study material first."
+            }), 400
+
+        language = material_store.get("language", "english")
+        total_questions = 10
+        language_rule = {
+            "urdu": "Ask and evaluate in Urdu only.",
+            "arabic": "Ask and evaluate in Arabic only.",
+            "english": "Ask and evaluate in English only.",
+            "mixed": "Use the same natural language style as the study material."
+        }.get(language, "Use the dominant language of the study material.")
+
+        if action == "start":
+            context = oral_context(
+                "Find important concepts, definitions, facts, processes, and "
+                "exam-relevant ideas for short oral questions."
+            )
+            instructions = f"""You are StudyFlow AI conducting a short oral exam.
+{language_rule}
+Create ONE short, clear oral question from the provided study material. Use ONLY the material. Do not use outside knowledge. Return ONLY JSON: {{"question":"short question","reference_answer":"short correct answer"}}"""
+
+            ai_result = generate_ai_response(
+                prompt=(
+                    f"STUDY MATERIAL:\n{context}\n\n"
+                    "Generate the first oral-exam question."
+                ),
+                system_instruction=instructions,
+                temperature=0.2
+            )
+            ai_text = ai_result.get("text") if isinstance(ai_result, dict) else ai_result
+            item = parse_json(ai_text)
+            question = str(item.get("question", "")).strip()
+            reference_answer = str(item.get("reference_answer", "")).strip()
+
+            if not question or not reference_answer:
+                raise ValueError("The AI did not return a valid oral-exam question.")
+
+            session_id = str(uuid.uuid4())
+            oral_exam_sessions[session_id] = {
+                "language": language,
+                "question_number": 1,
+                "total_questions": total_questions,
+                "score": 0,
+                "question": question,
+                "reference_answer": reference_answer
+            }
+            return jsonify({
+                "success": True,
+                "session_id": session_id,
+                "question": question,
+                "question_number": 1,
+                "total_questions": total_questions,
+                "language": language
+            })
+
+        if action != "evaluate":
+            return jsonify({
+                "success": False,
+                "error": "Invalid oral-exam action."
+            }), 400
+
+        session_id = str(data.get("session_id", "")).strip()
+        answer = str(data.get("answer", "")).strip()
+        session = oral_exam_sessions.get(session_id)
+
+        if not session:
+            return jsonify({
+                "success": False,
+                "error": "The oral-exam session has expired. Please start a new test."
+            }), 400
+
+        if not answer:
+            return jsonify({
+                "success": False,
+                "error": "No spoken answer was detected."
+            }), 400
+
+        # IMPORTANT: pass retrieved chunks to build_context, matching the
+        # successful question-generation path. Do not pass raw stored chunks.
+        context = oral_context(
+            f"Find information relevant to this oral-exam question: {session['question']}"
+        )
+        evaluation_instructions = f"""You are evaluating a student's spoken answer in an oral exam.
+{language_rule}
+Use ONLY the study material. Compare the student's answer with the reference answer and accept different wording when meaning is correct. Return ONLY JSON: {{"correct":true,"feedback":"Very short feedback starting with Correct or Incorrect.","score":1}}. score must be 1 or 0. Do not punish minor transcription or grammar differences when meaning is correct."""
+        evaluation_prompt = (
+            f"STUDY MATERIAL:\n{context}\n\n"
+            f"QUESTION:\n{session['question']}\n\n"
+            f"REFERENCE ANSWER:\n{session['reference_answer']}\n\n"
+            f"STUDENT SPOKEN ANSWER:\n{answer}"
+        )
+        evaluation_result = generate_ai_response(
+            prompt=evaluation_prompt,
+            system_instruction=evaluation_instructions,
+            temperature=0.1
+        )
+        evaluation_text = (
+            evaluation_result.get("text")
+            if isinstance(evaluation_result, dict)
+            else evaluation_result
+        )
+        evaluation = parse_json(evaluation_text)
+        correct = bool(evaluation.get("correct", False))
+        session["score"] += 1 if correct else 0
+        feedback = str(
+            evaluation.get("feedback", "Correct." if correct else "Incorrect.")
+        ).strip()
+        current_number = session["question_number"]
+
+        if current_number >= session["total_questions"]:
+            score = session["score"]
+            total = session["total_questions"]
+            oral_exam_sessions.pop(session_id, None)
+            return jsonify({
+                "success": True,
+                "completed": True,
+                "correct": correct,
+                "feedback": feedback,
+                "score": score,
+                "total_questions": total,
+                "final_message": f"Oral test complete. You scored {score} out of {total}."
+            })
+
+        next_context = oral_context(
+            "Find another important concept or fact for a short oral question. "
+            f"Avoid repeating this question: {session['question']}"
+        )
+        next_instructions = f"""You are StudyFlow AI conducting an oral exam.
+{language_rule}
+Generate ONE short oral question from the study material, different from the previous question. Use ONLY the material. Return ONLY JSON: {{"question":"short question","reference_answer":"short correct answer"}}"""
+        next_prompt = (
+            f"STUDY MATERIAL:\n{next_context}\n\n"
+            f"PREVIOUS QUESTION:\n{session['question']}\n\n"
+            "Generate the next oral question."
+        )
+        next_result = generate_ai_response(
+            prompt=next_prompt,
+            system_instruction=next_instructions,
+            temperature=0.2
+        )
+        next_text = next_result.get("text") if isinstance(next_result, dict) else next_result
+        next_item = parse_json(next_text)
+        next_question = str(next_item.get("question", "")).strip()
+        next_reference_answer = str(next_item.get("reference_answer", "")).strip()
+
+        if not next_question or not next_reference_answer:
+            raise ValueError("The AI did not return a valid next oral question.")
+
+        next_number = current_number + 1
+        session.update(
+            question_number=next_number,
+            question=next_question,
+            reference_answer=next_reference_answer
+        )
+        return jsonify({
+            "success": True,
+            "completed": False,
+            "correct": correct,
+            "feedback": feedback,
+            "score": session["score"],
+            "question_number": next_number,
+            "total_questions": session["total_questions"],
+            "next_question": next_question,
+            "language": session["language"]
+        })
+
     except Exception as error:
-        print("Oral exam error:",error)
-        return jsonify({"success":False,"error":f"Could not process the oral exam. {str(error)}"}),500
+        print("Oral exam error:", repr(error))
+        return jsonify({
+            "success": False,
+            "error": f"Could not process the oral exam. {str(error)}"
+        }), 500
 
 
 # ============================================================
