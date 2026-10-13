@@ -2500,6 +2500,7 @@ def submit_feedback():
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "User-Agent": "StudyFlowAI"
         },
         method="POST",
     )
