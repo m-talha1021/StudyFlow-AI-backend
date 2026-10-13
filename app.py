@@ -1,9 +1,17 @@
 import os
 import re
+import smtplib
+import ssl
+import json
+import urllib.error
+import urllib.request
+from email.message import EmailMessage
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
+
+load_dotenv()
 
 from google import genai
 from openai import OpenAI
@@ -2436,6 +2444,112 @@ Generate ONE short oral question from the study material, different from the pre
             "success": False,
             "error": f"Could not process the oral exam. {str(error)}"
         }), 500
+
+
+# ============================================================
+# USER FEEDBACK EMAIL
+# Preferred: RESEND_API_KEY, FEEDBACK_TO_EMAIL, RESEND_FROM_EMAIL.
+# SMTP variables remain supported as a fallback.
+# ============================================================
+
+@app.route("/api/feedback", methods=["POST", "OPTIONS"])
+def submit_feedback():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+    feedback_type = str(data.get("type", "General feedback")).strip()
+    message = str(data.get("message", "")).strip()
+    sender_name = str(data.get("name", "StudyFlow AI user")).strip()[:120]
+    reply_email = str(data.get("email", "")).strip()[:254]
+
+    if feedback_type not in {"Suggestion", "Bug report", "General feedback"}:
+        feedback_type = "General feedback"
+    if len(message) < 5:
+        return jsonify({"success": False, "error": "Please write at least 5 characters of feedback."}), 400
+    if len(message) > 3000:
+        return jsonify({"success": False, "error": "Feedback must be 3000 characters or fewer."}), 400
+    if reply_email and ("\n" in reply_email or "\r" in reply_email or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", reply_email)):
+        return jsonify({"success": False, "error": "Please provide a valid reply email address."}), 400
+
+    destination = os.getenv("FEEDBACK_TO_EMAIL", "").strip()
+    resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
+
+    if not destination:
+        return jsonify({"success": False, "error": "Feedback email is not configured yet. Please try again later."}), 503
+
+    subject = f"StudyFlow AI feedback: {feedback_type}"
+    body = (
+        "New feedback submitted through StudyFlow AI.\n\n"
+        f"Type: {feedback_type}\n"
+        f"Name: {sender_name or 'StudyFlow AI user'}\n"
+        f"Reply email: {reply_email or 'Not provided'}\n\n"
+        f"Feedback:\n{message}\n"
+    )
+
+    # Resend is preferred so the app does not need a Gmail App Password.
+    if resend_api_key:
+        sender = os.getenv("RESEND_FROM_EMAIL", "StudyFlow AI <onboarding@resend.dev>").strip()
+        payload = {
+            "from": sender,
+            "to": [destination],
+            "subject": subject,
+            "text": body,
+        }
+        if reply_email:
+            payload["reply_to"] = reply_email
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {resend_api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                if 200 <= response.status < 300:
+                    return jsonify({"success": True, "message": "Feedback sent successfully."}), 200
+                app.logger.error("Resend returned HTTP %s", response.status)
+                return jsonify({"success": False, "error": "We could not send your feedback right now. Please try again later."}), 502
+        except urllib.error.HTTPError as error:
+            details = error.read().decode("utf-8", errors="replace")[:500]
+            app.logger.error("Resend feedback email failed (HTTP %s): %s", error.code, details)
+            return jsonify({"success": False, "error": "We could not send your feedback right now. Please check the email service configuration."}), 502
+        except Exception as error:
+            app.logger.error("Resend feedback email delivery failed: %s", error)
+            return jsonify({"success": False, "error": "We could not send your feedback right now. Please try again later."}), 502
+
+    # Optional SMTP fallback for existing deployments.
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    use_tls = os.getenv("SMTP_USE_TLS", "true").lower() in {"1", "true", "yes"}
+
+    if not all([smtp_host, smtp_user, smtp_password]):
+        return jsonify({"success": False, "error": "Feedback email is not configured yet. Please try again later."}), 503
+
+    email_message = EmailMessage()
+    email_message["Subject"] = subject
+    email_message["From"] = smtp_user
+    email_message["To"] = destination
+    if reply_email:
+        email_message["Reply-To"] = reply_email
+    email_message.set_content(body)
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            if use_tls:
+                server.starttls(context=context)
+            server.login(smtp_user, smtp_password)
+            server.send_message(email_message)
+        return jsonify({"success": True, "message": "Feedback sent successfully."}), 200
+    except Exception as error:
+        app.logger.error("Feedback email delivery failed: %s", error)
+        return jsonify({"success": False, "error": "We could not send your feedback right now. Please try again later."}), 502
 
 
 # ============================================================
