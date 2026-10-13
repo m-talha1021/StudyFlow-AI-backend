@@ -2446,7 +2446,7 @@ Generate ONE short oral question from the study material, different from the pre
 # ============================================================
 # ============================================================
 # USER FEEDBACK EMAIL (Resend API)
-# Configure RESEND_API_KEY, FEEDBACK_TO_EMAIL, RESEND_FROM_EMAIL.
+# Configure RESEND_API_KEY, FEEDBACK_TO_EMAIL, RESEND_FROM_EMAIL in Vercel.
 # ============================================================
 
 @app.route("/api/feedback", methods=["POST", "OPTIONS"])
@@ -2458,7 +2458,6 @@ def submit_feedback():
     feedback_type = str(data.get("type", "General feedback")).strip()
     message = str(data.get("message", "")).strip()
     sender_name = str(data.get("name", "StudyFlow AI user")).strip()[:120]
-    reply_email = str(data.get("email", "")).strip()[:254]
 
     if feedback_type not in {"Suggestion", "Bug report", "General feedback"}:
         feedback_type = "General feedback"
@@ -2466,23 +2465,27 @@ def submit_feedback():
         return jsonify({"success": False, "error": "Please write at least 5 characters of feedback."}), 400
     if len(message) > 3000:
         return jsonify({"success": False, "error": "Feedback must be 3000 characters or fewer."}), 400
-    if reply_email and ("\\n" in reply_email or "\\r" in reply_email or not re.fullmatch(r"[^@\\s]+@[^@\\s]+\\.[^@\\s]+", reply_email)):
-        return jsonify({"success": False, "error": "Please provide a valid reply email address."}), 400
 
-    api_key = os.getenv("RESEND_API_KEY")
-    destination = os.getenv("FEEDBACK_TO_EMAIL")
-    sender = os.getenv("RESEND_FROM_EMAIL", "StudyFlow AI <onboarding@resend.dev>")
+    api_key = (os.getenv("RESEND_API_KEY") or "").strip()
+    destination = (os.getenv("FEEDBACK_TO_EMAIL") or "").strip()
+    sender = (os.getenv("RESEND_FROM_EMAIL") or "StudyFlow AI <onboarding@resend.dev>").strip()
 
-    if not all([api_key, destination, sender]):
-        app.logger.error("Feedback email configuration missing: RESEND_API_KEY, FEEDBACK_TO_EMAIL, or RESEND_FROM_EMAIL.")
+    if not api_key or not destination or not sender:
+        missing = [
+            name for name, value in (
+                ("RESEND_API_KEY", api_key),
+                ("FEEDBACK_TO_EMAIL", destination),
+                ("RESEND_FROM_EMAIL", sender),
+            ) if not value
+        ]
+        app.logger.error("Feedback email configuration missing variables: %s", ", ".join(missing))
         return jsonify({"success": False, "error": "Feedback email service is not configured. Check the Vercel environment variables."}), 503
 
     email_text = (
-        "New feedback submitted through StudyFlow AI.\\n\\n"
-        f"Type: {feedback_type}\\n"
-        f"Name: {sender_name or 'StudyFlow AI user'}\\n"
-        f"Reply email: {reply_email or 'Not provided'}\\n\\n"
-        f"Feedback:\\n{message}\\n"
+        "New feedback submitted through StudyFlow AI.\n\n"
+        f"Type: {feedback_type}\n"
+        f"Name: {sender_name or 'StudyFlow AI user'}\n\n"
+        f"Feedback:\n{message}\n"
     )
     payload = {
         "from": sender,
@@ -2490,8 +2493,6 @@ def submit_feedback():
         "subject": f"StudyFlow AI feedback: {feedback_type}",
         "text": email_text,
     }
-    if reply_email:
-        payload["reply_to"] = reply_email
 
     req = urllib.request.Request(
         "https://api.resend.com/emails",
@@ -2508,11 +2509,15 @@ def submit_feedback():
         return jsonify({"success": True, "message": "Feedback sent successfully."}), 200
     except urllib.error.HTTPError as error:
         details = error.read().decode("utf-8", errors="replace")
+        # Keep the provider's detailed response in server logs, never log the API key.
         app.logger.error("Resend rejected feedback email (HTTP %s): %s", error.code, details[:1000])
-        return jsonify({"success": False, "error": "Email service rejected the message. Check Resend sender/domain verification and Vercel settings."}), 502
+        return jsonify({
+            "success": False,
+            "error": f"Resend rejected the email (HTTP {error.code}). Check the Vercel function logs for details.",
+        }), 502
     except Exception:
-        app.logger.exception("Feedback email delivery failed.")
-        return jsonify({"success": False, "error": "We could not send your feedback right now. Please check the email service configuration."}), 502
+        app.logger.exception("Feedback email delivery failed before Resend confirmed acceptance.")
+        return jsonify({"success": False, "error": "We could not reach the email service. Check the Vercel function logs and try again."}), 502
 
 
 # ============================================================
