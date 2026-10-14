@@ -2461,8 +2461,6 @@ def submit_feedback():
 
     if feedback_type not in {"Suggestion", "Bug report", "General feedback"}:
         feedback_type = "General feedback"
-    if len(message) < 5:
-        return jsonify({"success": False, "error": "Please write at least 5 characters of feedback."}), 400
     if len(message) > 3000:
         return jsonify({"success": False, "error": "Feedback must be 3000 characters or fewer."}), 400
 
