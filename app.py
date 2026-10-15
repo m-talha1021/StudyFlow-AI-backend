@@ -614,7 +614,7 @@ def test_api():
 TRANSCRIPTION_ALLOWED_EXTENSIONS = {
     "mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg", "flac"
 }
-MAX_TRANSCRIPTION_UPLOAD_SIZE = 4 * 1024 * 1024  # Keep under Vercel request limits.
+MAX_TRANSCRIPTION_UPLOAD_SIZE = 15 * 1024 * 1024  # Keep under Vercel request limits.
 
 
 @app.route("/api/transcribe", methods=["POST", "OPTIONS"])
