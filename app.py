@@ -648,7 +648,7 @@ def transcribe_lecture():
         if len(file_bytes) > MAX_TRANSCRIPTION_UPLOAD_SIZE:
             return jsonify({
                 "success": False,
-                "error": "This deployment accepts files up to 4 MB. Choose a shorter or compressed clip; larger lectures require chunked/direct-storage uploads."
+                "error": "This deployment accepts files up to 15 MB. Choose a shorter or compressed clip; larger lectures require chunked/direct-storage uploads."
             }), 413
 
         mime_type = uploaded_file.mimetype or "application/octet-stream"
