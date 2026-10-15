@@ -1,5 +1,4 @@
 import os
-import io
 import re
 import json
 import urllib.request
@@ -605,82 +604,6 @@ def test_api():
         "message":
             "Hello from the StudyFlow AI backend!"
     })
-
-
-# ============================================================
-# AUDIO / VIDEO TRANSCRIPTION
-# ============================================================
-
-TRANSCRIPTION_ALLOWED_EXTENSIONS = {
-    "mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg", "flac"
-}
-MAX_TRANSCRIPTION_UPLOAD_SIZE = 4 * 1024 * 1024  # Keep under Vercel request limits.
-
-
-@app.route("/api/transcribe", methods=["POST", "OPTIONS"])
-def transcribe_lecture():
-    """Transcribe speech, then reuse the existing text language detector."""
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    if openai_client is None:
-        return jsonify({
-            "success": False,
-            "error": "Transcription is not configured. Add OPENAI_API_KEY to backend environment variables."
-        }), 503
-
-    uploaded_file = request.files.get("file")
-    if not uploaded_file or not uploaded_file.filename:
-        return jsonify({"success": False, "error": "Choose an audio or video file first."}), 400
-
-    filename = os.path.basename(uploaded_file.filename)
-    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if extension not in TRANSCRIPTION_ALLOWED_EXTENSIONS:
-        return jsonify({
-            "success": False,
-            "error": "Unsupported format. Use MP3, MP4, MPEG, M4A, WAV, WebM, OGG or FLAC."
-        }), 400
-
-    try:
-        file_bytes = uploaded_file.read(MAX_TRANSCRIPTION_UPLOAD_SIZE + 1)
-        if not file_bytes:
-            return jsonify({"success": False, "error": "The selected file is empty."}), 400
-        if len(file_bytes) > MAX_TRANSCRIPTION_UPLOAD_SIZE:
-            return jsonify({
-                "success": False,
-                "error": "This deployment accepts files up to 4 MB. Choose a shorter or compressed clip; larger lectures require chunked/direct-storage uploads."
-            }), 413
-
-        mime_type = uploaded_file.mimetype or "application/octet-stream"
-        transcription = openai_client.audio.transcriptions.create(
-            model="gpt-4o-mini-transcribe",
-            file=(filename, io.BytesIO(file_bytes), mime_type)
-        )
-        transcript_text = (getattr(transcription, "text", "") or "").strip()
-        if not transcript_text:
-            return jsonify({
-                "success": False,
-                "error": "No speech could be transcribed from this file."
-            }), 422
-
-        # Reuse the same language detector and normalizer as study materials.
-        detected_language = detect_language(transcript_text)
-        language = normalize_detected_language(detected_language, transcript_text)
-
-        return jsonify({
-            "success": True,
-            "filename": filename,
-            "language": language,
-            "transcript": transcript_text,
-            "characters": len(transcript_text),
-            "translated": False
-        })
-    except Exception as error:
-        print("Transcription error:", error)
-        return jsonify({
-            "success": False,
-            "error": "Could not transcribe this file. Check its format and confirm OPENAI_API_KEY is configured."
-        }), 500
 
 
 # ============================================================
