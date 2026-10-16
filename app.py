@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import tempfile
 import json
 import urllib.request
 import urllib.error
@@ -73,11 +74,21 @@ if OPENAI_API_KEY:
 # GEMINI MODELS
 # ============================================================
 
-GEMINI_MODELS = [
+# Ordered fallback chain. Override GEMINI_MODELS in the hosting environment
+# with a comma-separated list if you want to change the order or use models
+# enabled for your Google AI Studio / Gemini API account.
+_DEFAULT_GEMINI_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
-    "gemini-3.5-flash"
+    "gemini-2.5-flash",
 ]
+GEMINI_MODELS = list(dict.fromkeys(
+    model.strip()
+    for model in os.getenv("GEMINI_MODELS", ",".join(_DEFAULT_GEMINI_MODELS)).split(",")
+    if model.strip()
+))
 
 
 # ============================================================
@@ -97,6 +108,21 @@ OPENAI_MODELS = [
 # ============================================================
 
 app = Flask(__name__)
+
+# Accept files up to 100 MiB. The slightly larger request limit allows for
+# multipart/form-data headers around a 100 MiB file. The hosting platform and
+# reverse proxy must also allow request bodies of this size.
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 105 * 1024 * 1024
+app.config["MAX_FORM_MEMORY_SIZE"] = 2 * 1024 * 1024
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({
+        "success": False,
+        "error": "File too large. The maximum supported file size is 100 MB."
+    }), 413
 
 # ============================================================
 # CORS / VERCEL FRONTEND
@@ -219,7 +245,7 @@ IMAGE_MIME_TYPES = {
 }
 
 
-MAX_IMAGE_SIZE = 15 * 1024 * 1024
+MAX_IMAGE_SIZE = MAX_UPLOAD_SIZE
 
 
 # ============================================================
@@ -641,7 +667,7 @@ AUDIO_MIME_TYPES = {
     "ogg": "audio/ogg",
     "flac": "audio/flac",
 }
-MAX_TRANSCRIPTION_UPLOAD_SIZE = 4 * 1024 * 1024  # Per-request cap: Vercel rejects bodies over 4.5 MB. The frontend chunks larger lectures into small segments.
+MAX_TRANSCRIPTION_UPLOAD_SIZE = MAX_UPLOAD_SIZE  # Maximum audio/video file size: 100 MiB.
 
 # A verbatim speech-to-text engine must never translate or romanize.
 TRANSCRIPTION_SYSTEM_INSTRUCTION = (
@@ -991,34 +1017,81 @@ def detect_audio_language(file_bytes, mime_type):
     return ""
 
 
-def transcribe_with_gemini(file_bytes, mime_type, language_hint=None):
-    """Transcribe audio using the Gemini client, which is always configured."""
+def transcribe_with_gemini(file_bytes, mime_type, language_hint=None, filename="audio_upload"):
+    """Transcribe with an ordered Gemini fallback chain.
+
+    Small audio files are sent inline. Files larger than 20 MiB are uploaded
+    through Gemini Files API first, avoiding oversized inline API requests.
+    The same uploaded file is reused across model retries and then deleted.
+    """
     last_error = None
     prompt_text = build_transcription_prompt(language_hint)
+    uploaded_file = None
+    temp_path = None
+    contents_audio = None
 
-    for model_name in GEMINI_MODELS:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[
-                    types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-                    prompt_text,
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0,
-                    system_instruction=TRANSCRIPTION_SYSTEM_INSTRUCTION,
+    try:
+        if len(file_bytes) > 20 * 1024 * 1024:
+            suffix = os.path.splitext(filename)[1] or ".audio"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(file_bytes)
+                temp_path = temp_file.name
+
+            print(
+                f"[Transcription] Uploading large file ({len(file_bytes) / (1024 * 1024):.1f} MiB) "
+                "to Gemini Files API."
+            )
+            # Upload by path so the SDK can stream the file instead of placing
+            # the full payload into an inline generate_content request.
+            uploaded_file = client.files.upload(
+                file=temp_path,
+                config=types.UploadFileConfig(
+                    mime_type=mime_type,
+                    display_name=os.path.basename(filename),
                 ),
             )
-            candidate = (getattr(response, "text", "") or "").strip()
-            if candidate:
-                return candidate
-        except Exception as error:
-            last_error = error
-            print(f"[Transcription] Gemini model {model_name} failed:", error)
+            contents_audio = uploaded_file
+        else:
+            contents_audio = types.Part.from_bytes(
+                data=file_bytes,
+                mime_type=mime_type,
+            )
 
-    if last_error:
-        raise last_error
-    return ""
+        for model_name in GEMINI_MODELS:
+            try:
+                print(f"[Transcription] Trying Gemini model: {model_name}")
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[contents_audio, prompt_text],
+                    config=types.GenerateContentConfig(
+                        temperature=0,
+                        system_instruction=TRANSCRIPTION_SYSTEM_INSTRUCTION,
+                    ),
+                )
+                candidate = (getattr(response, "text", "") or "").strip()
+                if candidate:
+                    print(f"[Transcription] Gemini succeeded: {model_name}")
+                    return candidate
+                print(f"[Transcription] Gemini model {model_name} returned an empty transcript; trying next model.")
+            except Exception as error:
+                last_error = error
+                print(f"[Transcription] Gemini model {model_name} failed: {error}")
+                continue
+
+        if last_error:
+            raise last_error
+        return ""
+    finally:
+        if uploaded_file is not None:
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception as cleanup_error:
+                print("[Transcription] Could not delete temporary Gemini file:", cleanup_error)
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError as cleanup_error:
+                print("[Transcription] Could not remove temporary upload:", cleanup_error)
 
 
 def transcribe_with_openai(file_bytes, filename, mime_type, language_hint=None):
@@ -1070,7 +1143,7 @@ def transcribe_lecture():
         if len(file_bytes) > MAX_TRANSCRIPTION_UPLOAD_SIZE:
             return jsonify({
                 "success": False,
-                "error": "This upload segment is too large. Uploads are split automatically; please try again."
+                "error": "This audio/video file is larger than the 100 MB upload limit."
             }), 413
 
         mime_type = resolve_audio_mime(filename, uploaded_file.mimetype)
@@ -1098,7 +1171,7 @@ def transcribe_lecture():
         # required to boot, so try it first. Fall back to OpenAI, which is
         # optional, if Gemini cannot handle the clip.
         try:
-            transcript_text = transcribe_with_gemini(file_bytes, mime_type, hint)
+            transcript_text = transcribe_with_gemini(file_bytes, mime_type, hint, filename)
             if transcript_text:
                 provider = "Gemini"
         except Exception as error:
@@ -1278,7 +1351,7 @@ def process_material():
                             "success": False,
                             "error": (
                                 f"Image '{filename}' is too large. "
-                                "Please upload an image smaller than 15 MB."
+                                "Please upload an image no larger than 100 MB."
                             )
                         }), 400
 
