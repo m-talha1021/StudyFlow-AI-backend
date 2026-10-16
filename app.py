@@ -652,13 +652,19 @@ TRANSCRIPTION_SYSTEM_INSTRUCTION = (
 )
 
 # Native-script hints keep languages such as Urdu out of Latin transliteration.
+# The wording is deliberately explicit because models tend to drift from Urdu
+# into Hindi (Devanagari) or Latin transliteration unless told otherwise.
 NATIVE_SCRIPT_HINTS = {
-    "urdu": "the Urdu (Arabic) script, for example اردو",
+    "urdu": (
+        "Urdu written in the Urdu (Nastaliq/Arabic) script, for example اردو. "
+        "Urdu is NOT Hindi and must NEVER be written in Devanagari/Hindi script "
+        "or in Latin (Roman) letters"
+    ),
     "arabic": "the Arabic script, for example العربية",
     "persian": "the Persian (Arabic) script, for example فارسی",
     "pashto": "the Pashto (Arabic) script",
     "sindhi": "the Sindhi (Arabic) script",
-    "punjabi": "the Shahmukhi (Arabic) or Gurmukhi script",
+    "punjabi": "the Shahmukhi (Arabic) script for Punjabi, not Gurmukhi",
     "dari": "the Dari (Arabic) script",
     "hindi": "the Devanagari script, for example हिन्दी",
     "bengali": "the Bengali script",
@@ -672,6 +678,52 @@ NATIVE_SCRIPT_HINTS = {
     "chinese": "Chinese characters",
     "japanese": "Japanese script",
     "korean": "Hangul",
+}
+
+# Scripts that share the same spoken language family can be confused for one
+# another. Urdu and Hindi are the same spoken language (Hindustani) but use
+# completely different scripts, so the script of the transcript is checked and
+# repaired when it does not match the requested language.
+SCRIPT_CHARACTER_RANGES = {
+    "arabic": r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]",
+    "devanagari": r"[\u0900-\u097F]",
+    "gurmukhi": r"[\u0A00-\u0A7F]",
+    "bengali": r"[\u0980-\u09FF]",
+    "cyrillic": r"[\u0400-\u04FF]",
+    "hebrew": r"[\u0590-\u05FF]",
+    "greek": r"[\u0370-\u03FF]",
+    "thai": r"[\u0E00-\u0E7F]",
+    "tamil": r"[\u0B80-\u0BFF]",
+    "telugu": r"[\u0C00-\u0C7F]",
+    "cjk": r"[\u4E00-\u9FFF]",
+    "japanese": r"[\u3040-\u30FF]",
+    "hangul": r"[\uAC00-\uD7AF]",
+}
+
+# The script a language must be written in. Languages that use the Latin
+# alphabet are intentionally absent, meaning "no repair needed".
+LANGUAGE_SCRIPT = {
+    "urdu": "arabic",
+    "arabic": "arabic",
+    "persian": "arabic",
+    "pashto": "arabic",
+    "sindhi": "arabic",
+    "dari": "arabic",
+    "kashmiri": "arabic",
+    "balochi": "arabic",
+    "punjabi": "arabic",  # Shahmukhi is the Urdu-script form of Punjabi
+    "hindi": "devanagari",
+    "bengali": "bengali",
+    "russian": "cyrillic",
+    "ukrainian": "cyrillic",
+    "hebrew": "hebrew",
+    "greek": "greek",
+    "thai": "thai",
+    "tamil": "tamil",
+    "telugu": "telugu",
+    "chinese": "cjk",
+    "japanese": "japanese",
+    "korean": "hangul",
 }
 
 
@@ -701,8 +753,15 @@ def build_transcription_prompt(language_hint=None):
         if script:
             lines.insert(
                 1,
-                f"The speech is most likely in {language_hint}; if so, write it in {script}. Do not translate.",
+                f"The speech is in {language_hint}. Write it in {script}. Do not translate.",
             )
+            if language_hint in {"urdu", "hindi"}:
+                lines.insert(
+                    2,
+                    "Urdu and Hindi sound alike but are written differently. "
+                    f"If the language is {language_hint}, write it ONLY in {script}. "
+                    f"Never write {language_hint} in any other script.",
+                )
         else:
             lines.insert(
                 1,
@@ -719,6 +778,10 @@ AUDIO_LANGUAGE_PROMPT = (
     "Reply with ONLY the English name of that language in lowercase, "
     "for example: urdu, arabic, english, hindi, punjabi, persian, pashto, "
     "sindhi, spanish, french, bengali, turkish. "
+    "Note: Urdu and Hindi are the same spoken language (Hindustani). "
+    "Choose 'urdu' when the speaker uses Urdu words and Urdu pronunciation "
+    "(for example Alhamdulillah, Allah, karam, faiz), and 'hindi' only when "
+    "the speaker clearly uses Hindi/Sanskrit vocabulary. "
     "If the audio contains no speech at all, reply with: none"
 )
 
@@ -782,38 +845,72 @@ def clean_transcript_text(text):
     return cleaned.strip()
 
 
-# Languages that must be written in a non-Latin script. When the model
-# romanizes these (for example writing Urdu in Latin letters) the transcript
-# is repaired by rewriting it into the native script.
+# Languages that must be written in a specific (non-Latin) script. When the
+# model writes them in the wrong script (Urdu in Devanagari, or any of them in
+# Latin letters) the transcript is repaired by rewriting it into the native
+# script of the spoken language.
 NATIVE_SCRIPT_LANGUAGES = set(NATIVE_SCRIPT_HINTS)
+
+
+def count_latin_letters(text):
+    return len(re.findall(r"[A-Za-z\u00C0-\u024F]", text))
+
+
+def count_script_letters(text):
+    """Count letters that belong to any non-Latin script we track."""
+    total = 0
+    for pattern in SCRIPT_CHARACTER_RANGES.values():
+        total += len(re.findall(pattern, text))
+    return total
 
 
 def is_latin_dominant(text):
     """True when a transcript is written mostly with Latin letters."""
-    arabic_count, latin_count = count_script_characters(text)
-    other_script_count = len(
-        re.findall(
-            r"[\u0900-\u097F\u0980-\u09FF\u0400-\u04FF\u0590-\u05FF"
-            r"\u0370-\u03FF\u0E00-\u0E7F\u0B80-\u0BFF\u0C00-\u0C7F"
-            r"\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]",
-            text
-        )
-    )
-    total_letters = arabic_count + latin_count + other_script_count
+    latin_count = count_latin_letters(text)
+    other_script_count = count_script_letters(text)
+    total_letters = latin_count + other_script_count
     if total_letters == 0:
         return False
     return latin_count > 0 and latin_count >= total_letters * 0.6
 
 
+def text_matches_language_script(text, language):
+    """
+    True when the text is written in the script expected for the language.
+
+    For languages that use the Latin alphabet (or are unknown) there is no
+    script constraint, so this returns True.
+    """
+    expected_script = LANGUAGE_SCRIPT.get(language)
+    if not expected_script:
+        return True
+
+    expected_count = len(
+        re.findall(SCRIPT_CHARACTER_RANGES[expected_script], text)
+    )
+    latin_count = count_latin_letters(text)
+    other_script_count = count_script_letters(text) - expected_count
+
+    relevant = expected_count + latin_count + other_script_count
+    if relevant == 0:
+        return True
+
+    # The expected script must clearly dominate; otherwise it is the wrong
+    # script (for example Urdu written in Devanagari or in Latin letters).
+    return expected_count >= relevant * 0.6
+
+
 def rewrite_transcript_to_native_script(text, language):
     """
-    Repair a romanized/translated transcript by rewriting it into the native
-    script of the spoken language. Falls back to the original text on failure.
+    Repair a transcript written in the wrong script (translated, romanized or
+    written in a sibling script such as Hindi/Devanagari) by rewriting it into
+    the native script of the spoken language. Falls back to the original text
+    when the rewrite fails.
     """
     if not text or language not in NATIVE_SCRIPT_LANGUAGES:
         return text
 
-    if not is_latin_dominant(text):
+    if text_matches_language_script(text, language):
         return text
 
     script = NATIVE_SCRIPT_HINTS.get(language, language)
@@ -823,11 +920,13 @@ def rewrite_transcript_to_native_script(text, language):
         "word, translating, or adding labels."
     )
     prompt = (
-        f"The text below is spoken {language} written with Latin letters "
-        "(transliterated / Roman script).\n\n"
+        f"The text below is spoken {language} but it was written in the wrong "
+        "script (Latin letters or a different language's script such as Hindi).\n\n"
         f"Rewrite it EXACTLY into {script}, keeping every word and its order.\n"
-        "Rules: Do not translate. Do not add or remove any word. "
+        "Rules: Do not translate. Do not change the vocabulary or word order. "
+        "Do not add or remove any word. "
         "Do not add any label, note or sound description. "
+        f"The output must be {language} only. "
         "Return only the rewritten text.\n\n"
         f"{text}"
     )
@@ -839,7 +938,7 @@ def rewrite_transcript_to_native_script(text, language):
             temperature=0
         )
         rewritten = clean_transcript_text((result.get("text") or "").strip())
-        if rewritten and not is_latin_dominant(rewritten):
+        if rewritten and text_matches_language_script(rewritten, language):
             return rewritten
     except Exception as error:
         print("[Transcription] Native-script repair failed:", error)
@@ -990,11 +1089,17 @@ def transcribe_lecture():
         provider = None
         errors = []
 
-        # The client sends the language it already detected on the first
-        # segment so later segments stay locked to the same language.
+        # The client may force the recording language (the UI offers an
+        # explicit selector). Otherwise it sends the language detected on the
+        # first segment so later segments stay locked to the same language.
         language_hint = (request.form.get("language") or "").strip().lower()
         language_hint = re.sub(r"[^a-z ]", "", language_hint).strip()
-        if language_hint in NO_SPEECH_TOKENS or language_hint == "mixed":
+        if (
+            not language_hint
+            or language_hint == "auto"
+            or language_hint == "mixed"
+            or language_hint in NO_SPEECH_TOKENS
+        ):
             language_hint = ""
 
         # Detect the spoken language up front so a non-English lecture is
