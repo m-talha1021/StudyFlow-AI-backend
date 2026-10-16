@@ -628,9 +628,78 @@ def test_api():
 TRANSCRIPTION_ALLOWED_EXTENSIONS = {
     "mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg", "flac"
 }
-# Try the newer model first, then fall back to the widely available one.
+# OpenAI transcription models, used as a fallback when Gemini is unavailable.
 TRANSCRIPTION_MODELS = ["gpt-4o-mini-transcribe", "whisper-1"]
+AUDIO_MIME_TYPES = {
+    "mp3": "audio/mpeg",
+    "mpga": "audio/mpeg",
+    "mp4": "video/mp4",
+    "mpeg": "video/mpeg",
+    "m4a": "audio/mp4",
+    "wav": "audio/wav",
+    "webm": "audio/webm",
+    "ogg": "audio/ogg",
+    "flac": "audio/flac",
+}
 MAX_TRANSCRIPTION_UPLOAD_SIZE = 4 * 1024 * 1024  # Per-request cap: Vercel rejects bodies over 4.5 MB. The frontend chunks larger lectures into small segments.
+
+TRANSCRIPTION_PROMPT = (
+    "Transcribe the speech in this audio verbatim in its original language. "
+    "Return only the transcript text with no commentary, headings or translations."
+)
+
+
+def resolve_audio_mime(filename, fallback=None):
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return AUDIO_MIME_TYPES.get(extension, fallback or "application/octet-stream")
+
+
+def transcribe_with_gemini(file_bytes, mime_type):
+    """Transcribe audio using the Gemini client, which is always configured."""
+    last_error = None
+
+    for model_name in GEMINI_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                    TRANSCRIPTION_PROMPT,
+                ],
+                config=types.GenerateContentConfig(temperature=0),
+            )
+            candidate = (getattr(response, "text", "") or "").strip()
+            if candidate:
+                return candidate
+        except Exception as error:
+            last_error = error
+            print(f"[Transcription] Gemini model {model_name} failed:", error)
+
+    if last_error:
+        raise last_error
+    return ""
+
+
+def transcribe_with_openai(file_bytes, filename, mime_type):
+    """Transcribe audio using OpenAI as a secondary provider."""
+    last_error = None
+
+    for model_name in TRANSCRIPTION_MODELS:
+        try:
+            transcription = openai_client.audio.transcriptions.create(
+                model=model_name,
+                file=(filename, io.BytesIO(file_bytes), mime_type),
+            )
+            candidate = (getattr(transcription, "text", "") or "").strip()
+            if candidate:
+                return candidate
+        except Exception as error:
+            last_error = error
+            print(f"[Transcription] OpenAI model {model_name} failed:", error)
+
+    if last_error:
+        raise last_error
+    return ""
 
 
 @app.route("/api/transcribe", methods=["POST", "OPTIONS"])
@@ -638,12 +707,6 @@ def transcribe_lecture():
     """Transcribe speech, then reuse the existing text language detector."""
     if request.method == "OPTIONS":
         return ("", 204)
-
-    if openai_client is None:
-        return jsonify({
-            "success": False,
-            "error": "Transcription is not configured. Add OPENAI_API_KEY to backend environment variables."
-        }), 503
 
     uploaded_file = request.files.get("file")
     if not uploaded_file or not uploaded_file.filename:
@@ -667,35 +730,41 @@ def transcribe_lecture():
                 "error": "This upload segment is too large. Uploads are split automatically; please try again."
             }), 413
 
-        mime_type = uploaded_file.mimetype or "application/octet-stream"
+        mime_type = resolve_audio_mime(filename, uploaded_file.mimetype)
         transcript_text = ""
-        any_model_succeeded = False
+        provider = None
+        errors = []
 
-        for model_name in TRANSCRIPTION_MODELS:
+        # Gemini is the app's primary AI provider and GEMINI_API_KEY is
+        # required to boot, so try it first. Fall back to OpenAI, which is
+        # optional, if Gemini cannot handle the clip.
+        try:
+            transcript_text = transcribe_with_gemini(file_bytes, mime_type)
+            if transcript_text:
+                provider = "Gemini"
+        except Exception as error:
+            errors.append(f"Gemini: {error}")
+
+        if not transcript_text and openai_client is not None:
             try:
-                transcription = openai_client.audio.transcriptions.create(
-                    model=model_name,
-                    file=(filename, io.BytesIO(file_bytes), mime_type)
-                )
-                any_model_succeeded = True
-                candidate = (getattr(transcription, "text", "") or "").strip()
-                if candidate:
-                    transcript_text = candidate
-                    break
+                transcript_text = transcribe_with_openai(file_bytes, filename, mime_type)
+                if transcript_text:
+                    provider = "OpenAI"
             except Exception as error:
-                print(f"[Transcription] Model {model_name} failed:", error)
+                errors.append(f"OpenAI: {error}")
 
         if not transcript_text:
-            if any_model_succeeded:
+            if errors:
                 return jsonify({
                     "success": False,
-                    "error": "No speech could be transcribed from this file."
-                }), 422
+                    "error": "Transcription failed on the server. Check the Vercel function logs for details.",
+                    "details": " | ".join(errors)[:400]
+                }), 500
 
             return jsonify({
                 "success": False,
-                "error": "Transcription failed on the server. Verify that OPENAI_API_KEY is valid and has available quota, then check the Vercel function logs for details."
-            }), 500
+                "error": "No speech could be transcribed from this file."
+            }), 422
 
         # Reuse the same language detector and normalizer as study materials.
         detected_language = detect_language(transcript_text)
@@ -704,6 +773,7 @@ def transcribe_lecture():
         return jsonify({
             "success": True,
             "filename": filename,
+            "provider": provider,
             "language": language,
             "transcript": transcript_text,
             "characters": len(transcript_text),
@@ -713,7 +783,8 @@ def transcribe_lecture():
         print("Transcription error:", error)
         return jsonify({
             "success": False,
-            "error": "Could not transcribe this file. Check its format and confirm OPENAI_API_KEY is configured."
+            "error": "Could not transcribe this file.",
+            "details": str(error)[:400]
         }), 500
 
 
