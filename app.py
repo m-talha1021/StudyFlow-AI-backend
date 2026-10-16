@@ -115,10 +115,17 @@ FRONTEND_ORIGINS = {
     if origin.strip()
 }
 
-# The current Vercel preview URL pattern is also accepted. This is kept
-# narrow to this project rather than enabling CORS for every Vercel app.
+# The project's own Vercel production, preview and branch URLs all share
+# the "study-flow-" prefix. This keeps preview deployments working without
+# opening CORS to every unrelated vercel.app app.
 VERCEL_PREVIEW_ORIGIN_PATTERN = re.compile(
-    r"^https://study-flow-in597ve4c-muhammad-talhas-projects-[a-z0-9-]+\.vercel\.app$",
+    r"^https://study-flow-[a-z0-9-]+\.vercel\.app$",
+    re.IGNORECASE
+)
+
+# Local development servers run on a variety of ports.
+LOCALHOST_ORIGIN_PATTERN = re.compile(
+    r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     re.IGNORECASE
 )
 
@@ -132,6 +139,9 @@ def is_allowed_origin(origin):
     if normalized in FRONTEND_ORIGINS:
         return True
 
+    if LOCALHOST_ORIGIN_PATTERN.fullmatch(normalized):
+        return True
+
     return bool(VERCEL_PREVIEW_ORIGIN_PATTERN.fullmatch(normalized))
 
 
@@ -139,7 +149,11 @@ CORS(
     app,
     resources={
         r"/api/*": {
-            "origins": [*FRONTEND_ORIGINS, VERCEL_PREVIEW_ORIGIN_PATTERN],
+            "origins": [
+                *FRONTEND_ORIGINS,
+                LOCALHOST_ORIGIN_PATTERN,
+                VERCEL_PREVIEW_ORIGIN_PATTERN
+            ],
             "methods": ["GET", "POST", "OPTIONS"],
             "allow_headers": ["Content-Type", "Authorization"],
             "expose_headers": ["Content-Disposition"],
@@ -614,7 +628,9 @@ def test_api():
 TRANSCRIPTION_ALLOWED_EXTENSIONS = {
     "mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg", "flac"
 }
-MAX_TRANSCRIPTION_UPLOAD_SIZE = 15 * 1024 * 1024  # Keep under Vercel request limits.
+# Try the newer model first, then fall back to the widely available one.
+TRANSCRIPTION_MODELS = ["gpt-4o-mini-transcribe", "whisper-1"]
+MAX_TRANSCRIPTION_UPLOAD_SIZE = 4 * 1024 * 1024  # Per-request cap: Vercel rejects bodies over 4.5 MB. The frontend chunks larger lectures into small segments.
 
 
 @app.route("/api/transcribe", methods=["POST", "OPTIONS"])
@@ -648,20 +664,38 @@ def transcribe_lecture():
         if len(file_bytes) > MAX_TRANSCRIPTION_UPLOAD_SIZE:
             return jsonify({
                 "success": False,
-                "error": "This deployment accepts files up to 15 MB. Choose a shorter or compressed clip; larger lectures require chunked/direct-storage uploads."
+                "error": "This upload segment is too large. Uploads are split automatically; please try again."
             }), 413
 
         mime_type = uploaded_file.mimetype or "application/octet-stream"
-        transcription = openai_client.audio.transcriptions.create(
-            model="gpt-4o-mini-transcribe",
-            file=(filename, io.BytesIO(file_bytes), mime_type)
-        )
-        transcript_text = (getattr(transcription, "text", "") or "").strip()
+        transcript_text = ""
+        any_model_succeeded = False
+
+        for model_name in TRANSCRIPTION_MODELS:
+            try:
+                transcription = openai_client.audio.transcriptions.create(
+                    model=model_name,
+                    file=(filename, io.BytesIO(file_bytes), mime_type)
+                )
+                any_model_succeeded = True
+                candidate = (getattr(transcription, "text", "") or "").strip()
+                if candidate:
+                    transcript_text = candidate
+                    break
+            except Exception as error:
+                print(f"[Transcription] Model {model_name} failed:", error)
+
         if not transcript_text:
+            if any_model_succeeded:
+                return jsonify({
+                    "success": False,
+                    "error": "No speech could be transcribed from this file."
+                }), 422
+
             return jsonify({
                 "success": False,
-                "error": "No speech could be transcribed from this file."
-            }), 422
+                "error": "Transcription failed on the server. Verify that OPENAI_API_KEY is valid and has available quota, then check the Vercel function logs for details."
+            }), 500
 
         # Reuse the same language detector and normalizer as study materials.
         detected_language = detect_language(transcript_text)
