@@ -643,10 +643,208 @@ AUDIO_MIME_TYPES = {
 }
 MAX_TRANSCRIPTION_UPLOAD_SIZE = 4 * 1024 * 1024  # Per-request cap: Vercel rejects bodies over 4.5 MB. The frontend chunks larger lectures into small segments.
 
-TRANSCRIPTION_PROMPT = (
-    "Transcribe the speech in this audio verbatim in its original language. "
-    "Return only the transcript text with no commentary, headings or translations."
+# A verbatim speech-to-text engine must never translate or romanize.
+TRANSCRIPTION_SYSTEM_INSTRUCTION = (
+    "You are a verbatim speech-to-text engine. You always transcribe speech "
+    "in the exact language that was spoken and you always write it in that "
+    "language's native script. You never translate, romanize, summarize, "
+    "paraphrase or comment. You ignore all non-speech sounds."
 )
+
+# Native-script hints keep languages such as Urdu out of Latin transliteration.
+NATIVE_SCRIPT_HINTS = {
+    "urdu": "the Urdu (Arabic) script, for example اردو",
+    "arabic": "the Arabic script, for example العربية",
+    "persian": "the Persian (Arabic) script, for example فارسی",
+    "pashto": "the Pashto (Arabic) script",
+    "sindhi": "the Sindhi (Arabic) script",
+    "punjabi": "the Shahmukhi (Arabic) or Gurmukhi script",
+    "dari": "the Dari (Arabic) script",
+    "hindi": "the Devanagari script, for example हिन्दी",
+    "bengali": "the Bengali script",
+    "russian": "the Cyrillic script",
+    "ukrainian": "the Cyrillic script",
+    "hebrew": "the Hebrew script",
+    "greek": "the Greek script",
+    "thai": "the Thai script",
+    "tamil": "the Tamil script",
+    "telugu": "the Telugu script",
+    "chinese": "Chinese characters",
+    "japanese": "Japanese script",
+    "korean": "Hangul",
+}
+
+
+def build_transcription_prompt(language_hint=None):
+    """
+    Build a strict transcription instruction.
+
+    The prompt forces the original spoken language, forbids translation and
+    romanization, and tells the model to discard non-speech sounds such as
+    background music so the transcript never mentions them.
+    """
+    lines = [
+        "Transcribe the spoken words in this audio verbatim.",
+        "Rules:",
+        "- Output ONLY the transcript text.",
+        "- Keep the EXACT original spoken language. Never translate into English or any other language.",
+        "- Never romanize or transliterate: write each word using the native script of the spoken language.",
+        "- Do not add headings, notes, translations, timestamps, or commentary.",
+        "- Ignore background music, humming, instrumental audio and every other non-speech sound.",
+        "  Never write labels such as [Music], (music), notes like the musical symbols, "
+        "[Applause], [Laughter] or [Silence], and never describe sounds.",
+        "- If there is no speech in the segment, return an empty response.",
+    ]
+
+    if language_hint:
+        script = NATIVE_SCRIPT_HINTS.get(language_hint)
+        if script:
+            lines.insert(
+                1,
+                f"The speech is most likely in {language_hint}; if so, write it in {script}. Do not translate.",
+            )
+        else:
+            lines.insert(
+                1,
+                f"The speech is most likely in {language_hint}; if so, write it in {language_hint}. Do not translate.",
+            )
+
+    return "\n".join(lines)
+
+
+# Spoken-language detection is used to lock the transcript language. Without
+# it a model can "helpfully" translate a non-English lecture into English.
+AUDIO_LANGUAGE_PROMPT = (
+    "Identify the language being spoken in this audio. "
+    "Reply with ONLY the English name of that language in lowercase, "
+    "for example: urdu, arabic, english, hindi, punjabi, persian, pashto, "
+    "sindhi, spanish, french, bengali, turkish. "
+    "If the audio contains no speech at all, reply with: none"
+)
+
+NO_SPEECH_TOKENS = {"none", "no", "silence", "music", "unknown", "noise", "instrumental"}
+
+# Common spoken-language names, used to parse the model's detection reply.
+KNOWN_SPOKEN_LANGUAGES = set(NATIVE_SCRIPT_HINTS) | {
+    "english", "spanish", "french", "german", "italian", "portuguese",
+    "dutch", "turkish", "indonesian", "malay", "swahili", "vietnamese",
+    "polish", "romanian", "czech", "swedish", "norwegian", "danish",
+    "finnish", "kannada", "malayalam", "marathi", "gujarati", "odia",
+}
+
+# Words that frequently appear in a detection sentence but are not languages.
+LANGUAGE_REPLY_STOPWORDS = {
+    "the", "language", "is", "this", "audio", "spoken", "in", "a", "an",
+    "detected", "it", "appears", "to", "be", "speech", "contains", "no",
+    "i", "cannot", "determine", "sounds", "like", "with", "and", "only",
+    "clip", "recording", "voice", "speaker", "says", "of", "at",
+}
+
+# Markers such as [Music], (music), musical-note symbols or standalone sound
+# descriptions are removed so the transcript never mentions music or noise.
+NON_SPEECH_PATTERNS = [
+    re.compile(
+        r"\[\s*(?:music|musique|instrumental|instrumental music|background music|"
+        r"applause|clapping|cheering|laughter|laughs|chuckles|sighs|coughing|cough|"
+        r"sneezes|sniffing|silence|inaudible|indistinct|noise|noises|background|"
+        r"beep|beeps|intro|outro|sound|sounds|sound effect|sound effects|audio|"
+        r"birds|wind|rain|footsteps|door|phone)[^\]]*\]",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\(\s*(?:music|musique|instrumental|background music|applause|clapping|"
+        r"cheering|laughter|laughs|silence|inaudible|noise|background|sound effect|"
+        r"sound effects)[^\)]*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"[♪♫♬♩🎵🎶]+"),
+    re.compile(
+        r"^\s*(?:music|musique|instrumental|applause|laughter|silence|inaudible|"
+        r"background music|sound effect)\s*[.!]?\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+]
+
+
+def clean_transcript_text(text):
+    """Remove non-speech markers (especially music) and tidy whitespace."""
+    if not text:
+        return ""
+
+    cleaned = text
+    for pattern in NON_SPEECH_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned)
+
+    cleaned = re.sub(r"[ \t\u00A0]{2,}", " ", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+    cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+
+    return cleaned.strip()
+
+
+# Languages that must be written in a non-Latin script. When the model
+# romanizes these (for example writing Urdu in Latin letters) the transcript
+# is repaired by rewriting it into the native script.
+NATIVE_SCRIPT_LANGUAGES = set(NATIVE_SCRIPT_HINTS)
+
+
+def is_latin_dominant(text):
+    """True when a transcript is written mostly with Latin letters."""
+    arabic_count, latin_count = count_script_characters(text)
+    other_script_count = len(
+        re.findall(
+            r"[\u0900-\u097F\u0980-\u09FF\u0400-\u04FF\u0590-\u05FF"
+            r"\u0370-\u03FF\u0E00-\u0E7F\u0B80-\u0BFF\u0C00-\u0C7F"
+            r"\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]",
+            text
+        )
+    )
+    total_letters = arabic_count + latin_count + other_script_count
+    if total_letters == 0:
+        return False
+    return latin_count > 0 and latin_count >= total_letters * 0.6
+
+
+def rewrite_transcript_to_native_script(text, language):
+    """
+    Repair a romanized/translated transcript by rewriting it into the native
+    script of the spoken language. Falls back to the original text on failure.
+    """
+    if not text or language not in NATIVE_SCRIPT_LANGUAGES:
+        return text
+
+    if not is_latin_dominant(text):
+        return text
+
+    script = NATIVE_SCRIPT_HINTS.get(language, language)
+    system_instruction = (
+        "You are a verbatim transcriber. You convert text into the native "
+        "script of its language without changing a single word, adding any "
+        "word, translating, or adding labels."
+    )
+    prompt = (
+        f"The text below is spoken {language} written with Latin letters "
+        "(transliterated / Roman script).\n\n"
+        f"Rewrite it EXACTLY into {script}, keeping every word and its order.\n"
+        "Rules: Do not translate. Do not add or remove any word. "
+        "Do not add any label, note or sound description. "
+        "Return only the rewritten text.\n\n"
+        f"{text}"
+    )
+
+    try:
+        result = generate_ai_response(
+            prompt=prompt,
+            system_instruction=system_instruction,
+            temperature=0
+        )
+        rewritten = clean_transcript_text((result.get("text") or "").strip())
+        if rewritten and not is_latin_dominant(rewritten):
+            return rewritten
+    except Exception as error:
+        print("[Transcription] Native-script repair failed:", error)
+
+    return text
 
 
 def resolve_audio_mime(filename, fallback=None):
@@ -654,9 +852,61 @@ def resolve_audio_mime(filename, fallback=None):
     return AUDIO_MIME_TYPES.get(extension, fallback or "application/octet-stream")
 
 
-def transcribe_with_gemini(file_bytes, mime_type):
+def detect_audio_language(file_bytes, mime_type):
+    """
+    Ask the AI to identify the spoken language before transcribing.
+
+    Returns a lowercase language name, or an empty string when the language
+    cannot be determined (for example when the clip holds only music).
+    """
+    for model_name in GEMINI_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                    AUDIO_LANGUAGE_PROMPT,
+                ],
+                config=types.GenerateContentConfig(temperature=0),
+            )
+            raw = (getattr(response, "text", "") or "").strip().lower()
+            tokens = re.findall(r"[a-z]+", raw)
+            if not tokens:
+                continue
+
+            # "no speech" / "none" / "music only" mean there is nothing to transcribe.
+            if tokens == ["no"] or "none" in tokens or "silence" in tokens:
+                return ""
+            if "no" in tokens and "speech" in tokens:
+                return ""
+
+            name = ""
+            for token in reversed(tokens):
+                if token in KNOWN_SPOKEN_LANGUAGES:
+                    name = token
+                    break
+            if not name:
+                candidates = [
+                    token for token in tokens
+                    if token not in LANGUAGE_REPLY_STOPWORDS
+                    and token not in NO_SPEECH_TOKENS
+                ]
+                if len(candidates) == 1:
+                    name = candidates[0]
+
+            if not name or name in NO_SPEECH_TOKENS:
+                return ""
+            return name
+        except Exception as error:
+            print(f"[Transcription] Language detection failed ({model_name}):", error)
+
+    return ""
+
+
+def transcribe_with_gemini(file_bytes, mime_type, language_hint=None):
     """Transcribe audio using the Gemini client, which is always configured."""
     last_error = None
+    prompt_text = build_transcription_prompt(language_hint)
 
     for model_name in GEMINI_MODELS:
         try:
@@ -664,9 +914,12 @@ def transcribe_with_gemini(file_bytes, mime_type):
                 model=model_name,
                 contents=[
                     types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-                    TRANSCRIPTION_PROMPT,
+                    prompt_text,
                 ],
-                config=types.GenerateContentConfig(temperature=0),
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    system_instruction=TRANSCRIPTION_SYSTEM_INSTRUCTION,
+                ),
             )
             candidate = (getattr(response, "text", "") or "").strip()
             if candidate:
@@ -680,15 +933,17 @@ def transcribe_with_gemini(file_bytes, mime_type):
     return ""
 
 
-def transcribe_with_openai(file_bytes, filename, mime_type):
+def transcribe_with_openai(file_bytes, filename, mime_type, language_hint=None):
     """Transcribe audio using OpenAI as a secondary provider."""
     last_error = None
+    prompt_text = build_transcription_prompt(language_hint)
 
     for model_name in TRANSCRIPTION_MODELS:
         try:
             transcription = openai_client.audio.transcriptions.create(
                 model=model_name,
                 file=(filename, io.BytesIO(file_bytes), mime_type),
+                prompt=prompt_text,
             )
             candidate = (getattr(transcription, "text", "") or "").strip()
             if candidate:
@@ -735,11 +990,30 @@ def transcribe_lecture():
         provider = None
         errors = []
 
+        # The client sends the language it already detected on the first
+        # segment so later segments stay locked to the same language.
+        language_hint = (request.form.get("language") or "").strip().lower()
+        language_hint = re.sub(r"[^a-z ]", "", language_hint).strip()
+        if language_hint in NO_SPEECH_TOKENS or language_hint == "mixed":
+            language_hint = ""
+
+        # Detect the spoken language up front so a non-English lecture is
+        # never silently translated into English.
+        audio_language = language_hint
+        if not audio_language:
+            try:
+                audio_language = detect_audio_language(file_bytes, mime_type)
+            except Exception as error:
+                print("[Transcription] Audio language detection error:", error)
+                audio_language = ""
+
+        hint = audio_language or None
+
         # Gemini is the app's primary AI provider and GEMINI_API_KEY is
         # required to boot, so try it first. Fall back to OpenAI, which is
         # optional, if Gemini cannot handle the clip.
         try:
-            transcript_text = transcribe_with_gemini(file_bytes, mime_type)
+            transcript_text = transcribe_with_gemini(file_bytes, mime_type, hint)
             if transcript_text:
                 provider = "Gemini"
         except Exception as error:
@@ -747,7 +1021,7 @@ def transcribe_lecture():
 
         if not transcript_text and openai_client is not None:
             try:
-                transcript_text = transcribe_with_openai(file_bytes, filename, mime_type)
+                transcript_text = transcribe_with_openai(file_bytes, filename, mime_type, hint)
                 if transcript_text:
                     provider = "OpenAI"
             except Exception as error:
@@ -766,9 +1040,35 @@ def transcribe_lecture():
                 "error": "No speech could be transcribed from this file."
             }), 422
 
+        # Drop non-speech markers such as [Music] so music is never reported.
+        transcript_text = clean_transcript_text(transcript_text)
+
+        if not transcript_text:
+            return jsonify({
+                "success": False,
+                "error": "No speech could be transcribed from this file."
+            }), 422
+
+        # A model sometimes romanizes or translates non-Latin speech (for
+        # example writing Urdu in Latin letters). Rewrite it into the native
+        # script of the language that was actually spoken.
+        if audio_language in NATIVE_SCRIPT_LANGUAGES:
+            transcript_text = rewrite_transcript_to_native_script(
+                transcript_text, audio_language
+            )
+
         # Reuse the same language detector and normalizer as study materials.
         detected_language = detect_language(transcript_text)
         language = normalize_detected_language(detected_language, transcript_text)
+
+        # If the spoken language uses a non-Latin script (Urdu, Arabic, Hindi,
+        # ...) but the detector could not read the script, trust the audio
+        # detection so a translated or romanized transcript is still labelled
+        # in its true language.
+        if audio_language and audio_language in NATIVE_SCRIPT_HINTS and language in {"english", "unknown"}:
+            language = audio_language
+        elif language == "unknown" and audio_language:
+            language = audio_language
 
         return jsonify({
             "success": True,
