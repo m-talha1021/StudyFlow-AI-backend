@@ -728,45 +728,34 @@ LANGUAGE_SCRIPT = {
 
 
 def build_transcription_prompt(language_hint=None):
-    """
-    Build a strict transcription instruction.
-
-    The prompt forces the original spoken language, forbids translation and
-    romanization, and tells the model to discard non-speech sounds such as
-    background music so the transcript never mentions them.
-    """
+    """Transcribe multilingual audio without translating or changing scripts."""
     lines = [
-        "Transcribe the spoken words in this audio verbatim.",
-        "Rules:",
-        "- Output ONLY the transcript text.",
-        "- Keep the EXACT original spoken language. Never translate into English or any other language.",
-        "- Never romanize or transliterate: write each word using the native script of the spoken language.",
-        "- Do not add headings, notes, translations, timestamps, or commentary.",
-        "- Ignore background music, humming, instrumental audio and every other non-speech sound.",
-        "  Never write labels such as [Music], (music), notes like the musical symbols, "
-        "[Applause], [Laughter] or [Silence], and never describe sounds.",
-        "- If there is no speech in the segment, return an empty response.",
+        "Transcribe all spoken words in this audio verbatim.",
+        "This recording may contain multiple languages, including Urdu, Arabic, and English.",
+        "Detect language changes throughout the recording, not just at the beginning.",
+        "Preserve each language in its original spoken language and native writing system.",
+        "Write Urdu in Urdu script, Arabic in Arabic script, and English in Latin letters.",
+        "For English mixed with Urdu, keep English words in English letters and Urdu words in Urdu script.",
+        "For Urdu mixed with Arabic, keep Urdu and Arabic words in their respective original scripts.",
+        "Do not translate, romanize, transliterate, summarize, or paraphrase.",
+        "Do not convert Urdu into Hindi or Hindi into Urdu.",
+        "Do not force all words into one language or one writing system.",
+        "Preserve the original order of speech, including code-switching and sentences containing multiple languages.",
+        "Output ONLY the transcript text, with no headings, language labels, translations, timestamps, or commentary.",
+        "Ignore music, humming, instrumental audio, and other non-speech sounds.",
+        "Do not include labels such as [Music], [Applause], or [Silence].",
+        "If there is no intelligible speech, return an empty response.",
     ]
 
-    if language_hint:
-        script = NATIVE_SCRIPT_HINTS.get(language_hint)
-        if script:
-            lines.insert(
-                1,
-                f"The speech is in {language_hint}. Write it in {script}. Do not translate.",
-            )
-            if language_hint in {"urdu", "hindi"}:
-                lines.insert(
-                    2,
-                    "Urdu and Hindi sound alike but are written differently. "
-                    f"If the language is {language_hint}, write it ONLY in {script}. "
-                    f"Never write {language_hint} in any other script.",
-                )
-        else:
-            lines.insert(
-                1,
-                f"The speech is most likely in {language_hint}; if so, write it in {language_hint}. Do not translate.",
-            )
+    # Apply a language-specific hint only when the caller explicitly supplies one.
+    # In automatic mode, leave language_hint empty so mixed languages are preserved.
+    if language_hint and language_hint in NATIVE_SCRIPT_HINTS:
+        script = NATIVE_SCRIPT_HINTS[language_hint]
+        lines.insert(
+            1,
+            f"The user selected {language_hint}; write that language in {script}. "
+            "Still preserve any other languages in the recording in their own scripts.",
+        )
 
     return "\n".join(lines)
 
@@ -1089,30 +1078,21 @@ def transcribe_lecture():
         provider = None
         errors = []
 
-        # The client may force the recording language (the UI offers an
-        # explicit selector). Otherwise it sends the language detected on the
-        # first segment so later segments stay locked to the same language.
-        language_hint = (request.form.get("language") or "").strip().lower()
+        # Auto-detect mode must not lock every segment to the language
+        # detected in the first segment. The transcription prompt supports
+        # English + Urdu, Urdu + Arabic, and other language combinations.
+        language_hint = (request.form.get("language") or "auto").strip().lower()
         language_hint = re.sub(r"[^a-z ]", "", language_hint).strip()
-        if (
-            not language_hint
-            or language_hint == "auto"
-            or language_hint == "mixed"
-            or language_hint in NO_SPEECH_TOKENS
-        ):
-            language_hint = ""
 
-        # Detect the spoken language up front so a non-English lecture is
-        # never silently translated into English.
-        audio_language = language_hint
-        if not audio_language:
-            try:
-                audio_language = detect_audio_language(file_bytes, mime_type)
-            except Exception as error:
-                print("[Transcription] Audio language detection error:", error)
-                audio_language = ""
-
-        hint = audio_language or None
+        if language_hint in {"", "auto", "mixed", "unknown", "none", "no"}:
+            audio_language = ""
+            hint = None
+        elif language_hint in NATIVE_SCRIPT_HINTS or language_hint == "english":
+            audio_language = language_hint
+            hint = language_hint
+        else:
+            audio_language = ""
+            hint = None
 
         # Gemini is the app's primary AI provider and GEMINI_API_KEY is
         # required to boot, so try it first. Fall back to OpenAI, which is
@@ -1157,7 +1137,10 @@ def transcribe_lecture():
         # A model sometimes romanizes or translates non-Latin speech (for
         # example writing Urdu in Latin letters). Rewrite it into the native
         # script of the language that was actually spoken.
-        if audio_language in NATIVE_SCRIPT_LANGUAGES:
+        # Only run whole-transcript script repair for an explicitly selected
+        # single language. Never rewrite an auto-detected multilingual transcript
+        # (for example English + Urdu) into one script.
+        if hint and audio_language in NATIVE_SCRIPT_LANGUAGES:
             transcript_text = rewrite_transcript_to_native_script(
                 transcript_text, audio_language
             )
