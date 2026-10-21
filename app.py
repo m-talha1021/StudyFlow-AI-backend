@@ -770,6 +770,7 @@ def build_transcription_prompt(language_hint=None):
         "Output ONLY the transcript text, with no headings, language labels, translations, timestamps, or commentary.",
         "Ignore music, humming, instrumental audio, and other non-speech sounds.",
         "Do not include labels such as [Music], [Applause], or [Silence].",
+        "If there are two speakers in the audio then write it as [Speaker 1] or [Speaker 2] before the dialouge or talk respectively",
         "If there is no intelligible speech, return an empty response.",
     ]
 
