@@ -79,10 +79,14 @@ if OPENAI_API_KEY:
 # enabled for your Google AI Studio / Gemini API account.
 _DEFAULT_GEMINI_MODELS = [
     "gemini-3.8-flash",
+    "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
+    "gemini-2.5-pro",
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.8-flash-tts",
 ]
 GEMINI_MODELS = list(dict.fromkeys(
     model.strip()
@@ -99,6 +103,7 @@ OPENAI_MODELS = [
     "gpt-6-luna",
     "gpt-5.6-luna",
     "gpt-5.4-mini",
+    "gpt-6.1-terra",
     "gpt-5.1",
     "gpt-4.1-mini",
 ]
@@ -128,10 +133,6 @@ def request_too_large(_error):
 # CORS / VERCEL FRONTEND
 # ============================================================
 
-# Production frontend plus Vercel preview deployments.
-# You can override these with FRONTEND_ORIGINS in Vercel, using
-# comma-separated origins, for example:
-# https://study-flow-ai-lac.vercel.app,http://localhost:5173
 FRONTEND_ORIGINS = {
     origin.strip().rstrip("/")
     for origin in os.getenv(
