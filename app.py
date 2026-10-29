@@ -39,7 +39,12 @@ from pdf_generator import generate_pdf
 # ============================================================
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# OpenAI is disabled by default to avoid accidental paid API calls.
+# Set ENABLE_OPENAI_FALLBACK=true only if you want to use it as a paid fallback.
+ENABLE_OPENAI_FALLBACK = os.getenv("ENABLE_OPENAI_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 if not GEMINI_API_KEY:
@@ -59,14 +64,39 @@ client = genai.Client(
 
 
 # ============================================================
-# OPENAI CLIENT
+# PROVIDER CLIENTS
 # ============================================================
 
-openai_client = None
+# Groq and OpenRouter both expose OpenAI-compatible APIs, so the existing
+# openai SDK can call them by changing base_url. These clients are optional.
+groq_client = None
+if GROQ_API_KEY:
+    groq_client = OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+        timeout=45.0,
+        max_retries=0,
+    )
 
-if OPENAI_API_KEY:
+openrouter_client = None
+if OPENROUTER_API_KEY:
+    openrouter_client = OpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+        timeout=60.0,
+        max_retries=0,
+        default_headers={
+            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://study-flow-ai-lac.vercel.app"),
+            "X-Title": os.getenv("OPENROUTER_APP_NAME", "StudyFlowAI"),
+        },
+    )
+
+openai_client = None
+if OPENAI_API_KEY and ENABLE_OPENAI_FALLBACK:
     openai_client = OpenAI(
-        api_key=OPENAI_API_KEY
+        api_key=OPENAI_API_KEY,
+        timeout=45.0,
+        max_retries=0,
     )
 
 
@@ -81,9 +111,9 @@ if OPENAI_API_KEY:
 # models. Long chains of unavailable model IDs made every request wait through
 # repeated failures before returning a result.
 _DEFAULT_GEMINI_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
 ]
 GEMINI_MODELS = list(dict.fromkeys(
     model.strip()
@@ -93,14 +123,45 @@ GEMINI_MODELS = list(dict.fromkeys(
 
 
 # ============================================================
-# OPENAI MODELS
+# GROQ / OPENROUTER / OPTIONAL OPENAI MODELS
 # ============================================================
 
-# Use known API model IDs. Invalid IDs add avoidable latency during fallback.
-OPENAI_MODELS = [
-    "gpt-4.1-mini",
-    "gpt-4o-mini",
+# Groq model IDs are configurable because model availability and free-tier
+# limits can change. These are current supported chat model IDs, but Groq's
+# API is quota-limited and may charge according to the account/tier.
+_DEFAULT_GROQ_MODELS = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
 ]
+GROQ_MODELS = list(dict.fromkeys(
+    model.strip()
+    for model in os.getenv("GROQ_MODELS", ",".join(_DEFAULT_GROQ_MODELS)).split(",")
+    if model.strip()
+))
+
+# This router selects an available FREE OpenRouter chat model. It avoids
+# hard-coding a specific :free model whose availability may change. Do not add
+# paid model IDs to this list if you want to keep this fallback free-only.
+_DEFAULT_OPENROUTER_MODELS = ["openrouter/free"]
+OPENROUTER_MODELS = list(dict.fromkeys(
+    model.strip()
+    for model in os.getenv("OPENROUTER_MODELS", ",".join(_DEFAULT_OPENROUTER_MODELS)).split(",")
+    if model.strip()
+))
+
+# Paid OpenAI models are only used when ENABLE_OPENAI_FALLBACK=true and a key
+# is present. They are deliberately not enabled just because a key exists.
+OPENAI_MODELS = [
+    model.strip()
+    for model in os.getenv("OPENAI_MODELS", "gpt-4.1-mini,gpt-4o-mini").split(",")
+    if model.strip()
+]
+
+print(f"[Providers] Gemini configured: {bool(GEMINI_API_KEY)}")
+print(f"[Providers] Groq configured: {bool(GROQ_API_KEY)}")
+print(f"[Providers] OpenRouter configured: {bool(OPENROUTER_API_KEY)}")
+print(f"[Providers] OpenAI paid fallback enabled: {openai_client is not None}")
+
 
 # ============================================================
 # FLASK APP
@@ -490,128 +551,108 @@ def generate_ai_response(
     system_instruction=None,
     temperature=0.2
 ):
+    """Generate text with ordered fallbacks: Gemini, Groq, OpenRouter free.
+
+    OpenAI is an optional paid fallback and is disabled unless
+    ENABLE_OPENAI_FALLBACK=true is explicitly set.
     """
-    Generate a text response using Gemini first.
-
-    If every configured Gemini model fails, automatically try
-    the configured OpenAI models in order.
-
-    Returns a dictionary containing the generated text, provider
-    and model that actually produced the response.
-    """
-
     last_error = None
 
-    # --------------------------------------------------------
-    # 1. TRY GEMINI MODELS
-    # --------------------------------------------------------
-
+    # 1. Gemini
     for model_name in GEMINI_MODELS:
-
         try:
-
-            print(
-                f"[AI] Trying Gemini model: {model_name}"
-            )
-
+            print(f"[AI] Trying Gemini model: {model_name}")
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    temperature=temperature
-                )
+                    temperature=temperature,
+                ),
             )
-
-            if response and response.text:
-
-                print(
-                    f"[AI] Gemini succeeded: {model_name}"
-                )
-
-                return {
-                    "text": response.text,
-                    "provider": "Gemini",
-                    "model": model_name
-                }
-
+            candidate = (getattr(response, "text", "") or "").strip()
+            if candidate:
+                print(f"[AI] Gemini succeeded: {model_name}")
+                return {"text": candidate, "provider": "Gemini", "model": model_name}
+            last_error = RuntimeError(f"Gemini model {model_name} returned an empty response")
         except Exception as error:
-
             last_error = error
+            print(f"[AI] Gemini failed: {model_name}: {error}")
 
-            print(
-                f"[AI] Gemini failed: {model_name}"
-            )
-            print(error)
-
-            continue
-
-    # --------------------------------------------------------
-    # 2. GEMINI FAILED → TRY OPENAI MODELS
-    # --------------------------------------------------------
-
-    if openai_client is not None:
-
-        for model_name in OPENAI_MODELS:
-
+    # 2. Groq chat models
+    if groq_client is not None:
+        for model_name in GROQ_MODELS:
             try:
-
-                print(
-                    f"[AI] Trying OpenAI model: {model_name}"
+                print(f"[AI] Trying Groq model: {model_name}")
+                messages = []
+                if system_instruction:
+                    messages.append({"role": "system", "content": system_instruction})
+                messages.append({"role": "user", "content": prompt})
+                response = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=temperature,
                 )
+                candidate = (response.choices[0].message.content or "").strip()
+                if candidate:
+                    print(f"[AI] Groq succeeded: {model_name}")
+                    return {"text": candidate, "provider": "Groq", "model": model_name}
+                last_error = RuntimeError(f"Groq model {model_name} returned an empty response")
+            except Exception as error:
+                last_error = error
+                print(f"[AI] Groq failed: {model_name}: {error}")
+    else:
+        print("[AI] GROQ_API_KEY is not configured; skipping Groq.")
 
-                request_args = {
-                    "model": model_name,
-                    "input": prompt
-                }
+    # 3. OpenRouter free-only router. openrouter/free selects a free model;
+    # never silently fall back to paid models.
+    if openrouter_client is not None:
+        for model_name in OPENROUTER_MODELS:
+            try:
+                print(f"[AI] Trying OpenRouter model: {model_name}")
+                messages = []
+                if system_instruction:
+                    messages.append({"role": "system", "content": system_instruction})
+                messages.append({"role": "user", "content": prompt})
+                response = openrouter_client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=temperature,
+                )
+                candidate = (response.choices[0].message.content or "").strip()
+                if candidate:
+                    print(f"[AI] OpenRouter succeeded: {model_name}")
+                    return {"text": candidate, "provider": "OpenRouter", "model": model_name}
+                last_error = RuntimeError(f"OpenRouter model {model_name} returned an empty response")
+            except Exception as error:
+                last_error = error
+                print(f"[AI] OpenRouter failed: {model_name}: {error}")
+    else:
+        print("[AI] OPENROUTER_API_KEY is not configured; skipping OpenRouter.")
 
+    # 4. Optional OpenAI paid fallback
+    if openai_client is not None:
+        for model_name in OPENAI_MODELS:
+            try:
+                print(f"[AI] Trying optional OpenAI model: {model_name}")
+                request_args = {"model": model_name, "input": prompt}
                 if system_instruction:
                     request_args["instructions"] = system_instruction
-
-                response = openai_client.responses.create(
-                    **request_args
-                )
-
-                if response and response.output_text:
-
-                    print(
-                        f"[AI] OpenAI succeeded: {model_name}"
-                    )
-
-                    return {
-                        "text": response.output_text,
-                        "provider": "OpenAI",
-                        "model": model_name
-                    }
-
+                response = openai_client.responses.create(**request_args)
+                candidate = (getattr(response, "output_text", "") or "").strip()
+                if candidate:
+                    print(f"[AI] OpenAI succeeded: {model_name}")
+                    return {"text": candidate, "provider": "OpenAI", "model": model_name}
+                last_error = RuntimeError(f"OpenAI model {model_name} returned an empty response")
             except Exception as error:
-
                 last_error = error
-
-                print(
-                    f"[AI] OpenAI failed: {model_name}"
-                )
-                print(error)
-
-                continue
-
+                print(f"[AI] OpenAI failed: {model_name}: {error}")
     else:
-
-        print(
-            "[AI] OPENAI_API_KEY is not configured; "
-            "skipping OpenAI fallback."
-        )
-
-    # --------------------------------------------------------
-    # 3. ALL TEXT MODELS FAILED
-    # --------------------------------------------------------
+        print("[AI] Optional OpenAI fallback disabled or OPENAI_API_KEY missing.")
 
     if last_error:
         raise last_error
-
-    raise RuntimeError(
-        "All configured AI models are currently unavailable."
-    )
+    raise RuntimeError("All configured AI providers are unavailable. Check API keys and provider quotas.")
 
 
 # ============================================================
@@ -649,8 +690,22 @@ def test_api():
 TRANSCRIPTION_ALLOWED_EXTENSIONS = {
     "mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg", "flac"
 }
-# OpenAI transcription models, used as a fallback when Gemini is unavailable.
-TRANSCRIPTION_MODELS = ["gpt-4o-mini-transcribe", "whisper-1"]
+# Groq multilingual Whisper models. These are API models, not guaranteed
+# unlimited-free models; the account's free-tier quota and file-size cap apply.
+GROQ_TRANSCRIPTION_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GROQ_TRANSCRIPTION_MODELS",
+        "whisper-large-v3-turbo,whisper-large-v3",
+    ).split(",")
+    if model.strip()
+]
+# OpenAI transcription is an optional paid fallback, disabled by default.
+TRANSCRIPTION_MODELS = [
+    model.strip()
+    for model in os.getenv("OPENAI_TRANSCRIPTION_MODELS", "gpt-4o-mini-transcribe,whisper-1").split(",")
+    if model.strip()
+]
 AUDIO_MIME_TYPES = {
     "mp3": "audio/mpeg",
     "mpga": "audio/mpeg",
@@ -1090,8 +1145,50 @@ def transcribe_with_gemini(file_bytes, mime_type, language_hint=None, filename="
                 print("[Transcription] Could not remove temporary upload:", cleanup_error)
 
 
+def transcribe_with_groq(file_bytes, filename, mime_type, language_hint=None):
+    """Transcribe multilingual audio using Groq Whisper models."""
+    if groq_client is None:
+        return ""
+
+    # Groq documents a 25 MB maximum upload for its free tier. Skip rather than
+    # wasting time retrying a file that cannot fit; Gemini may accept up to 100 MB.
+    groq_max_bytes = int(os.getenv("GROQ_TRANSCRIPTION_MAX_BYTES", str(25 * 1024 * 1024)))
+    if len(file_bytes) > groq_max_bytes:
+        raise ValueError(
+            "This file exceeds the configured Groq transcription upload limit "
+            f"({groq_max_bytes // (1024 * 1024)} MB). Gemini was tried first; "
+            "use a smaller file or configure a larger eligible Groq limit."
+        )
+
+    last_error = None
+    prompt_text = build_transcription_prompt(language_hint)
+    for model_name in GROQ_TRANSCRIPTION_MODELS:
+        try:
+            print(f"[Transcription] Trying Groq model: {model_name}")
+            transcription = groq_client.audio.transcriptions.create(
+                model=model_name,
+                file=(filename, io.BytesIO(file_bytes), mime_type),
+                prompt=prompt_text[:800],
+                temperature=0.0,
+            )
+            candidate = (getattr(transcription, "text", "") or "").strip()
+            if candidate:
+                print(f"[Transcription] Groq succeeded: {model_name}")
+                return candidate
+            last_error = RuntimeError(f"Groq model {model_name} returned an empty transcript")
+        except Exception as error:
+            last_error = error
+            print(f"[Transcription] Groq model {model_name} failed: {error}")
+
+    if last_error:
+        raise last_error
+    return ""
+
+
 def transcribe_with_openai(file_bytes, filename, mime_type, language_hint=None):
-    """Transcribe audio using OpenAI as a secondary provider."""
+    """Transcribe audio using OpenAI only when paid fallback is enabled."""
+    if openai_client is None:
+        return ""
     last_error = None
     prompt_text = build_transcription_prompt(language_hint)
 
@@ -1163,15 +1260,22 @@ def transcribe_lecture():
             audio_language = ""
             hint = None
 
-        # Gemini is the app's primary AI provider and GEMINI_API_KEY is
-        # required to boot, so try it first. Fall back to OpenAI, which is
-        # optional, if Gemini cannot handle the clip.
+        # Gemini is tried first. Groq Whisper is the multilingual transcription
+        # fallback. OpenAI transcription is optional and disabled by default.
         try:
             transcript_text = transcribe_with_gemini(file_bytes, mime_type, hint, filename)
             if transcript_text:
                 provider = "Gemini"
         except Exception as error:
             errors.append(f"Gemini: {error}")
+
+        if not transcript_text and groq_client is not None:
+            try:
+                transcript_text = transcribe_with_groq(file_bytes, filename, mime_type, hint)
+                if transcript_text:
+                    provider = "Groq"
+            except Exception as error:
+                errors.append(f"Groq: {error}")
 
         if not transcript_text and openai_client is not None:
             try:
