@@ -77,16 +77,13 @@ if OPENAI_API_KEY:
 # Ordered fallback chain. Override GEMINI_MODELS in the hosting environment
 # with a comma-separated list if you want to change the order or use models
 # enabled for your Google AI Studio / Gemini API account.
+# Keep the default fallback chain short and use generally available text/vision
+# models. Long chains of unavailable model IDs made every request wait through
+# repeated failures before returning a result.
 _DEFAULT_GEMINI_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-3.8-flash-tts",
+    "gemini-2.0-flash",
 ]
 GEMINI_MODELS = list(dict.fromkeys(
     model.strip()
@@ -99,13 +96,10 @@ GEMINI_MODELS = list(dict.fromkeys(
 # OPENAI MODELS
 # ============================================================
 
+# Use known API model IDs. Invalid IDs add avoidable latency during fallback.
 OPENAI_MODELS = [
-    "gpt-6-luna",
-    "gpt-5.6-luna",
-    "gpt-5.4-mini",
-    "gpt-6.1-terra",
-    "gpt-5.1",
     "gpt-4.1-mini",
+    "gpt-4o-mini",
 ]
 
 # ============================================================
@@ -1364,7 +1358,7 @@ def process_material():
                     image_text = ""
                     last_image_error = None
 
-                    for model_name in GEMINI_MODELS:
+                    for model_name in GEMINI_MODELS[:2]:
                         try:
                             print(
                                 f"Trying image model: {model_name} "
@@ -1516,7 +1510,10 @@ def process_material():
             "file_count": len(filenames),
             "characters": len(text),
             "language": language,
-            "chunks": len(chunks)
+            "chunks": len(chunks),
+            # The browser keeps this text so generation still works when
+            # serverless requests land on a different function instance.
+            "materialText": text[:120000]
         })
 
     except Exception as error:
@@ -1586,6 +1583,22 @@ def generate_result():
                     "Invalid generation mode."
             }), 400
 
+
+        # ====================================================
+        # RESTORE MATERIAL FOR SERVERLESS INSTANCES
+        # ====================================================
+
+        incoming_material = (data.get("materialText") or "").strip()
+        if incoming_material and (
+            not material_store["chunks"] or
+            material_store.get("text") != incoming_material
+        ):
+            material_store["text"] = incoming_material
+            material_store["language"] = normalize_detected_language(
+                detect_language(incoming_material), incoming_material
+            )
+            material_store["chunks"] = chunk_text(incoming_material)
+            material_store["embeddings"] = create_embeddings(material_store["chunks"])
 
         # ====================================================
         # CHECK MATERIAL
