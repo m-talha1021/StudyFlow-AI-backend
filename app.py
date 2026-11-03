@@ -2378,27 +2378,94 @@ Generate exactly {count} exam questions now.
 Return ONLY the requested JSON array.
 """
 
-        ai_result = generate_ai_response(
-            prompt=prompt,
-            system_instruction=instructions,
-            temperature=0.25
-        )
-
-        raw = ai_result["text"].strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-
-        start = raw.find("[")
-        end = raw.rfind("]")
-
-        if start == -1 or end <= start:
-            raise ValueError("The AI returned an invalid test format.")
-
         import json
-        questions = json.loads(raw[start:end + 1])
 
-        if not isinstance(questions, list):
-            raise ValueError("The AI did not return a question list.")
+        def extract_json_array(raw_text):
+            """Extract one complete JSON array, tolerating fences and trailing commas."""
+            if not isinstance(raw_text, str) or not raw_text.strip():
+                raise ValueError("The AI returned an empty test response.")
+
+            candidate = raw_text.strip().lstrip("\ufeff")
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\s*```$", "", candidate).strip()
+
+            # Locate the first array and find its matching closing bracket without
+            # being confused by brackets inside quoted question/option text.
+            start_index = candidate.find("[")
+            if start_index < 0:
+                raise ValueError("The AI response did not contain a JSON question array.")
+
+            depth = 0
+            in_string = False
+            escaped = False
+            end_index = -1
+            for index in range(start_index, len(candidate)):
+                char = candidate[index]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+                if char == '"':
+                    in_string = True
+                elif char == "[":
+                    depth += 1
+                elif char == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end_index = index + 1
+                        break
+
+            if end_index < 0:
+                raise ValueError("The AI response was incomplete or truncated before the JSON array finished.")
+
+            json_text = candidate[start_index:end_index]
+            # Models occasionally add a trailing comma before a closing bracket/brace.
+            json_text = re.sub(r",\s*([}\]])", r"\1", json_text)
+            try:
+                parsed = json.loads(json_text)
+            except json.JSONDecodeError as parse_error:
+                raise ValueError(
+                    f"The AI returned malformed JSON near character {parse_error.pos}."
+                ) from parse_error
+
+            if isinstance(parsed, dict):
+                parsed = parsed.get("questions") or parsed.get("items") or parsed.get("data")
+            if not isinstance(parsed, list):
+                raise ValueError("The AI response did not contain a list of questions.")
+            return parsed
+
+        # One corrective retry handles occasional provider formatting/truncation
+        # without changing the requested exam size or exposing parser internals.
+        last_parse_error = None
+        ai_result = None
+        questions = []
+        for attempt in range(2):
+            request_prompt = prompt if attempt == 0 else (
+                prompt + "\n\nIMPORTANT: Your previous response was not valid complete JSON. "
+                "Return a complete JSON array only. Escape quotation marks inside strings, "
+                "do not use trailing commas, and include all requested questions."
+            )
+            ai_result = generate_ai_response(
+                prompt=request_prompt,
+                system_instruction=instructions,
+                temperature=0.1 if attempt else 0.2
+            )
+            raw = ai_result.get("text", "") if isinstance(ai_result, dict) else str(ai_result)
+            try:
+                questions = extract_json_array(raw)
+                if questions:
+                    break
+                raise ValueError("The AI returned an empty question list.")
+            except (ValueError, TypeError) as parse_error:
+                last_parse_error = parse_error
+                if attempt == 1:
+                    raise ValueError(
+                        "The AI could not produce a valid test format after retry. Please try generating the test again."
+                    ) from parse_error
 
         cleaned_questions = []
         seen = set()
@@ -2409,12 +2476,20 @@ Return ONLY the requested JSON array.
 
             question = str(item.get("question", "")).strip()
             options = item.get("options", [])
-            answer = str(item.get("answer", "")).strip()
+            answer = str(
+                item.get("answer", item.get("correct_answer", item.get("correct", "")))
+            ).strip()
 
             if not question or not isinstance(options, list) or len(options) != 4:
                 continue
 
-            options = [str(option).strip() for option in options]
+            options = [
+                str(option.get("text", option.get("value", ""))).strip()
+                if isinstance(option, dict) else str(option).strip()
+                for option in options
+            ]
+            if answer.upper() in {"A", "B", "C", "D"}:
+                answer = options[ord(answer.upper()) - ord("A")]
 
             if any(not option for option in options):
                 continue
@@ -2436,13 +2511,13 @@ Return ONLY the requested JSON array.
             if len(cleaned_questions) >= count:
                 break
 
-        if len(cleaned_questions) < count:
+        if len(cleaned_questions) < min(5, count):
             raise ValueError(
-                f"The AI generated only {len(cleaned_questions)} valid questions; {count} are required."
+                "The AI response did not contain enough valid multiple-choice questions. Please try again."
             )
 
         # One minute per question gives a predictable exam duration.
-        duration_seconds = count * 60
+        duration_seconds = len(cleaned_questions) * 60
 
         return jsonify({
             "success": True,
@@ -2460,8 +2535,8 @@ Return ONLY the requested JSON array.
         return jsonify({
             "success": False,
             "error": (
-                "Could not generate the Test concepts exam. "
-                f"{str(error)}"
+                str(error) if isinstance(error, ValueError)
+                else "Could not generate the Test concepts exam. Please try again."
             )
         }), 500
 
