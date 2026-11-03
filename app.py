@@ -1,4 +1,4 @@
-\import os
+import os
 import re
 import json
 import urllib.request
@@ -1641,61 +1641,74 @@ Return ONLY the requested JSON array.
             temperature=0.25
         )
 
-        raw = ai_result["text"].strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw).strip()
+        def extract_json_array(response_text):
+            """Extract and parse a JSON array from an AI response."""
+            candidate = (response_text or "").strip()
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\s*```$", "", candidate).strip()
+            first = candidate.find("[")
+            last = candidate.rfind("]")
+            if first < 0 or last <= first:
+                raise ValueError("No JSON array found in AI response")
+            candidate = candidate[first:last + 1]
+            # Safe cleanup for the common trailing-comma error.
+            candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+            parsed = json.loads(candidate)
+            if not isinstance(parsed, list):
+                raise ValueError("AI response was not a JSON array")
+            return parsed
 
-        start = raw.find("[")
-        end = raw.rfind("]")
-
-        if start == -1 or end <= start:
-            raise ValueError("The AI returned an invalid test format.")
-
-        # Model output can occasionally contain invalid JSON (for example,
-        # trailing commas or unescaped quotation marks inside question text).
-        # Try strict parsing first, then safe cleanup, then ask the configured
-        # model fallback chain to repair the JSON once instead of failing the
-        # entire exam immediately.
-        json_text = raw[start:end + 1]
-
+        raw = ai_result.get("text", "")
         try:
-            questions = json.loads(json_text)
-        except json.JSONDecodeError as first_error:
-            cleaned_json = re.sub(r",\s*([}\]])", r"\1", json_text)
+            questions = extract_json_array(raw)
+        except (json.JSONDecodeError, ValueError):
+            # First fallback: ask the configured model to repair its own output.
+            # Keep the repair response isolated and validate it before use.
             try:
-                questions = json.loads(cleaned_json)
-            except json.JSONDecodeError:
                 repair_result = generate_ai_response(
                     prompt=(
-                        "Repair the following invalid JSON into a valid JSON array "
-                        "of multiple-choice exam questions. Preserve the content and "
-                        "return ONLY valid JSON, with double-quoted keys and strings, "
-                        "escaped internal quotation marks, no trailing commas, and no "
-                        "Markdown fences. Required item shape: "
-                        '{"question":"...","options":["A","B","C","D"],"answer":"A"}.\n\n'
-                        "Invalid JSON:\n" + json_text
+                        "Convert the content below into a valid JSON array of MCQ objects. "
+                        "Each object must contain question, options (exactly four strings), "
+                        "and answer (exactly matching one option). Preserve the meaning. "
+                        "Escape any quotation marks inside strings. Remove trailing commas. "
+                        "Return only JSON, without Markdown or commentary.\n\n"
+                        "Content to repair:\n" + str(raw)[:18000]
                     ),
                     system_instruction=(
-                        "You are a JSON repair utility. Output only a valid JSON array. "
-                        "Do not add commentary or change the intended answers."
+                        "You are a strict JSON formatter. Output one valid JSON array only. "
+                        "Use double quotes for all keys and strings. Do not include commentary."
                     ),
                     temperature=0
                 )
-                repaired = repair_result["text"].strip()
-                repaired = re.sub(
-                    r"^```(?:json)?\s*|\s*```$", "", repaired,
-                    flags=re.IGNORECASE
-                ).strip()
-                repair_start = repaired.find("[")
-                repair_end = repaired.rfind("]")
-                if repair_start < 0 or repair_end <= repair_start:
-                    raise ValueError(
-                        f"The AI returned malformed exam JSON (line {first_error.lineno}, "
-                        f"column {first_error.colno}). Please try generating the test again."
-                    )
-                questions = json.loads(
-                    re.sub(r",\s*([}\]])", r"\1", repaired[repair_start:repair_end + 1])
+                questions = extract_json_array(repair_result.get("text", ""))
+            except Exception:
+                # Second fallback: regenerate a clean, compact response instead of
+                # exposing a variable JSON line/column error to the user.
+                retry_result = generate_ai_response(
+                    prompt=(
+                        f"Create exactly {count} multiple-choice questions using only this study material.\n"
+                        f"Detected language: {language}.\n"
+                        "Return a valid JSON array only. Every object must have exactly these keys: "
+                        '"question", "options", "answer". "options" must be an array of exactly '
+                        "four distinct strings. "
+                        '"answer" must exactly match one of the four options. Do not use quotation '
+                        "marks inside question or option text; avoid commas after the last item.\n\n"
+                        "Study material:\n" + context[:14000]
+                    ),
+                    system_instruction=(
+                        "Output only syntactically valid JSON. No Markdown fences, no extra text, "
+                        "no trailing commas. Keep each question and option concise."
+                    ),
+                    temperature=0
                 )
+                try:
+                    questions = extract_json_array(retry_result.get("text", ""))
+                except Exception as final_error:
+                    print("Test concepts JSON parsing failed after retries:", str(final_error))
+                    raise ValueError(
+                        "The AI returned an invalid exam format after automatic retries. "
+                        "Please try again; if it continues, reduce the number of questions or upload clearer material."
+                    ) from None
 
         if not isinstance(questions, list):
             raise ValueError("The AI did not return a question list.")
