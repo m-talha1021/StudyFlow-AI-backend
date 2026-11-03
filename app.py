@@ -1,5 +1,7 @@
 import os
+import io
 import re
+import tempfile
 import json
 import urllib.request
 import urllib.error
@@ -20,7 +22,6 @@ from language_detector import detect_language
 
 from rag import (
     chunk_text,
-    create_embeddings,
     retrieve_chunks,
     build_context
 )
@@ -37,7 +38,12 @@ from pdf_generator import generate_pdf
 # ============================================================
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# OpenAI is disabled by default to avoid accidental paid API calls.
+# Set ENABLE_OPENAI_FALLBACK=true only if you want to use it as a paid fallback.
+ENABLE_OPENAI_FALLBACK = os.getenv("ENABLE_OPENAI_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 if not GEMINI_API_KEY:
@@ -57,14 +63,39 @@ client = genai.Client(
 
 
 # ============================================================
-# OPENAI CLIENT
+# PROVIDER CLIENTS
 # ============================================================
 
-openai_client = None
+# Groq and OpenRouter both expose OpenAI-compatible APIs, so the existing
+# openai SDK can call them by changing base_url. These clients are optional.
+groq_client = None
+if GROQ_API_KEY:
+    groq_client = OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+        timeout=float(os.getenv("GROQ_TIMEOUT_SECONDS", "18")),
+        max_retries=0,
+    )
 
-if OPENAI_API_KEY:
+openrouter_client = None
+if OPENROUTER_API_KEY:
+    openrouter_client = OpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+        timeout=float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "18")),
+        max_retries=0,
+        default_headers={
+            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://study-flow-ai-lac.vercel.app"),
+            "X-Title": os.getenv("OPENROUTER_APP_NAME", "StudyFlowAI"),
+        },
+    )
+
+openai_client = None
+if OPENAI_API_KEY and ENABLE_OPENAI_FALLBACK:
     openai_client = OpenAI(
-        api_key=OPENAI_API_KEY
+        api_key=OPENAI_API_KEY,
+        timeout=45.0,
+        max_retries=0,
     )
 
 
@@ -72,24 +103,64 @@ if OPENAI_API_KEY:
 # GEMINI MODELS
 # ============================================================
 
-GEMINI_MODELS = [
+# Ordered fallback chain. Override GEMINI_MODELS in the hosting environment
+# with a comma-separated list if you want to change the order or use models
+# enabled for your Google AI Studio / Gemini API account.
+# Keep the default fallback chain short and use generally available text/vision
+# models. Long chains of unavailable model IDs made every request wait through
+# repeated failures before returning a result.
+_DEFAULT_GEMINI_MODELS = [
+    "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash"
+    "gemini-3.6-flash",
 ]
+GEMINI_MODELS = list(dict.fromkeys(
+    model.strip()
+    for model in os.getenv("GEMINI_MODELS", ",".join(_DEFAULT_GEMINI_MODELS)).split(",")
+    if model.strip()
+))
 
 
 # ============================================================
-# OPENAI MODELS
+# GROQ / OPENROUTER / OPTIONAL OPENAI MODELS
 # ============================================================
 
+# Groq model IDs are configurable because model availability and free-tier
+# limits can change. These are current supported chat model IDs, but Groq's
+# API is quota-limited and may charge according to the account/tier.
+_DEFAULT_GROQ_MODELS = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+]
+GROQ_MODELS = list(dict.fromkeys(
+    model.strip()
+    for model in os.getenv("GROQ_MODELS", ",".join(_DEFAULT_GROQ_MODELS)).split(",")
+    if model.strip()
+))
+
+# This router selects an available FREE OpenRouter chat model. It avoids
+# hard-coding a specific :free model whose availability may change. Do not add
+# paid model IDs to this list if you want to keep this fallback free-only.
+_DEFAULT_OPENROUTER_MODELS = ["openrouter/free"]
+OPENROUTER_MODELS = list(dict.fromkeys(
+    model.strip()
+    for model in os.getenv("OPENROUTER_MODELS", ",".join(_DEFAULT_OPENROUTER_MODELS)).split(",")
+    if model.strip()
+))
+
+# Paid OpenAI models are only used when ENABLE_OPENAI_FALLBACK=true and a key
+# is present. They are deliberately not enabled just because a key exists.
 OPENAI_MODELS = [
-    "gpt-6-luna",
-    "gpt-5.6-luna",
-    "gpt-5.4-mini",
-    "gpt-5.1",
-    "gpt-4.1-mini",
+    model.strip()
+    for model in os.getenv("OPENAI_MODELS", "gpt-4.1-mini,gpt-4o-mini").split(",")
+    if model.strip()
 ]
+
+print(f"[Providers] Gemini configured: {bool(GEMINI_API_KEY)}")
+print(f"[Providers] Groq configured: {bool(GROQ_API_KEY)}")
+print(f"[Providers] OpenRouter configured: {bool(OPENROUTER_API_KEY)}")
+print(f"[Providers] OpenAI paid fallback enabled: {openai_client is not None}")
+
 
 # ============================================================
 # FLASK APP
@@ -97,14 +168,25 @@ OPENAI_MODELS = [
 
 app = Flask(__name__)
 
+# Accept files up to 100 MiB. The slightly larger request limit allows for
+# multipart/form-data headers around a 100 MiB file. The hosting platform and
+# reverse proxy must also allow request bodies of this size.
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 105 * 1024 * 1024
+app.config["MAX_FORM_MEMORY_SIZE"] = 2 * 1024 * 1024
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({
+        "success": False,
+        "error": "File too large. The maximum supported file size is 100 MB."
+    }), 413
+
 # ============================================================
 # CORS / VERCEL FRONTEND
 # ============================================================
 
-# Production frontend plus Vercel preview deployments.
-# You can override these with FRONTEND_ORIGINS in Vercel, using
-# comma-separated origins, for example:
-# https://study-flow-ai-lac.vercel.app,http://localhost:5173
 FRONTEND_ORIGINS = {
     origin.strip().rstrip("/")
     for origin in os.getenv(
@@ -114,10 +196,17 @@ FRONTEND_ORIGINS = {
     if origin.strip()
 }
 
-# The current Vercel preview URL pattern is also accepted. This is kept
-# narrow to this project rather than enabling CORS for every Vercel app.
+# The project's own Vercel production, preview and branch URLs all share
+# the "study-flow-" prefix. This keeps preview deployments working without
+# opening CORS to every unrelated vercel.app app.
 VERCEL_PREVIEW_ORIGIN_PATTERN = re.compile(
-    r"^https://study-flow-in597ve4c-muhammad-talhas-projects-[a-z0-9-]+\.vercel\.app$",
+    r"^https://study-flow-[a-z0-9-]+\.vercel\.app$",
+    re.IGNORECASE
+)
+
+# Local development servers run on a variety of ports.
+LOCALHOST_ORIGIN_PATTERN = re.compile(
+    r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     re.IGNORECASE
 )
 
@@ -131,6 +220,9 @@ def is_allowed_origin(origin):
     if normalized in FRONTEND_ORIGINS:
         return True
 
+    if LOCALHOST_ORIGIN_PATTERN.fullmatch(normalized):
+        return True
+
     return bool(VERCEL_PREVIEW_ORIGIN_PATTERN.fullmatch(normalized))
 
 
@@ -138,7 +230,11 @@ CORS(
     app,
     resources={
         r"/api/*": {
-            "origins": [*FRONTEND_ORIGINS, VERCEL_PREVIEW_ORIGIN_PATTERN],
+            "origins": [
+                *FRONTEND_ORIGINS,
+                LOCALHOST_ORIGIN_PATTERN,
+                VERCEL_PREVIEW_ORIGIN_PATTERN
+            ],
             "methods": ["GET", "POST", "OPTIONS"],
             "allow_headers": ["Content-Type", "Authorization"],
             "expose_headers": ["Content-Disposition"],
@@ -204,7 +300,7 @@ IMAGE_MIME_TYPES = {
 }
 
 
-MAX_IMAGE_SIZE = 15 * 1024 * 1024
+MAX_IMAGE_SIZE = MAX_UPLOAD_SIZE
 
 
 # ============================================================
@@ -214,12 +310,27 @@ MAX_IMAGE_SIZE = 15 * 1024 * 1024
 # Active AI oral-exam sessions.
 oral_exam_sessions = {}
 
-material_store = {
-    "text": "",
-    "language": "unknown",
-    "chunks": [],
-    "embeddings": []
-}
+# Material is request-scoped. Do not store user documents in module globals.
+
+
+def resolve_request_material(data):
+    """Build material state from THIS request, never from process-global memory.
+
+    Frontend sends processedMaterialText with each generation call. This keeps
+    Vercel instances isolated and avoids cross-user material leakage.
+    """
+    raw = data.get("materialText") or data.get("text") or ""
+    text = str(raw).strip()
+    if not text:
+        return None
+    # Bound request context to protect serverless memory and provider token limits.
+    max_chars = int(os.getenv("MAX_MATERIAL_CHARS", "120000"))
+    text = text[:max_chars]
+    detected = normalize_detected_language(detect_language(text), text)
+    chunks = chunk_text(text)
+    if not chunks:
+        return None
+    return {"text": text, "language": detected, "chunks": chunks, "embeddings": []}
 
 
 # ============================================================
@@ -454,128 +565,112 @@ def generate_ai_response(
     system_instruction=None,
     temperature=0.2
 ):
+    """Generate text with ordered fallbacks: Gemini, Groq, OpenRouter free.
+
+    OpenAI is an optional paid fallback and is disabled unless
+    ENABLE_OPENAI_FALLBACK=true is explicitly set.
     """
-    Generate a text response using Gemini first.
-
-    If every configured Gemini model fails, automatically try
-    the configured OpenAI models in order.
-
-    Returns a dictionary containing the generated text, provider
-    and model that actually produced the response.
-    """
-
     last_error = None
+    # Bound prompts to protect latency, memory, and free-tier quotas.
+    max_prompt_chars = int(os.getenv("MAX_AI_PROMPT_CHARS", "36000"))
+    if len(prompt) > max_prompt_chars:
+        prompt = prompt[:max_prompt_chars] + "\n\n[Context shortened to fit the configured request limit.]"
 
-    # --------------------------------------------------------
-    # 1. TRY GEMINI MODELS
-    # --------------------------------------------------------
-
-    for model_name in GEMINI_MODELS:
-
+    # 1. Gemini
+    for model_name in GEMINI_MODELS[:1]:
         try:
-
-            print(
-                f"[AI] Trying Gemini model: {model_name}"
-            )
-
+            print(f"[AI] Trying Gemini model: {model_name}")
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    temperature=temperature
-                )
+                    temperature=temperature,
+                ),
             )
-
-            if response and response.text:
-
-                print(
-                    f"[AI] Gemini succeeded: {model_name}"
-                )
-
-                return {
-                    "text": response.text,
-                    "provider": "Gemini",
-                    "model": model_name
-                }
-
+            candidate = (getattr(response, "text", "") or "").strip()
+            if candidate:
+                print(f"[AI] Gemini succeeded: {model_name}")
+                return {"text": candidate, "provider": "Gemini", "model": model_name}
+            last_error = RuntimeError(f"Gemini model {model_name} returned an empty response")
         except Exception as error:
-
             last_error = error
+            print(f"[AI] Gemini failed: {model_name}: {error}")
 
-            print(
-                f"[AI] Gemini failed: {model_name}"
-            )
-            print(error)
-
-            continue
-
-    # --------------------------------------------------------
-    # 2. GEMINI FAILED → TRY OPENAI MODELS
-    # --------------------------------------------------------
-
-    if openai_client is not None:
-
-        for model_name in OPENAI_MODELS:
-
+    # 2. Groq chat models
+    if groq_client is not None:
+        for model_name in GROQ_MODELS:
             try:
-
-                print(
-                    f"[AI] Trying OpenAI model: {model_name}"
+                print(f"[AI] Trying Groq model: {model_name}")
+                messages = []
+                if system_instruction:
+                    messages.append({"role": "system", "content": system_instruction})
+                messages.append({"role": "user", "content": prompt})
+                response = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=temperature,
                 )
+                candidate = (response.choices[0].message.content or "").strip()
+                if candidate:
+                    print(f"[AI] Groq succeeded: {model_name}")
+                    return {"text": candidate, "provider": "Groq", "model": model_name}
+                last_error = RuntimeError(f"Groq model {model_name} returned an empty response")
+            except Exception as error:
+                last_error = error
+                print(f"[AI] Groq failed: {model_name}: {error}")
+    else:
+        print("[AI] GROQ_API_KEY is not configured; skipping Groq.")
 
-                request_args = {
-                    "model": model_name,
-                    "input": prompt
-                }
+    # 3. OpenRouter free-only router. openrouter/free selects a free model;
+    # never silently fall back to paid models.
+    if openrouter_client is not None:
+        for model_name in OPENROUTER_MODELS:
+            try:
+                print(f"[AI] Trying OpenRouter model: {model_name}")
+                messages = []
+                if system_instruction:
+                    messages.append({"role": "system", "content": system_instruction})
+                messages.append({"role": "user", "content": prompt})
+                response = openrouter_client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=temperature,
+                )
+                candidate = (response.choices[0].message.content or "").strip()
+                if candidate:
+                    print(f"[AI] OpenRouter succeeded: {model_name}")
+                    return {"text": candidate, "provider": "OpenRouter", "model": model_name}
+                last_error = RuntimeError(f"OpenRouter model {model_name} returned an empty response")
+            except Exception as error:
+                last_error = error
+                print(f"[AI] OpenRouter failed: {model_name}: {error}")
+    else:
+        print("[AI] OPENROUTER_API_KEY is not configured; skipping OpenRouter.")
 
+    # 4. Optional OpenAI paid fallback
+    if openai_client is not None:
+        for model_name in OPENAI_MODELS:
+            try:
+                print(f"[AI] Trying optional OpenAI model: {model_name}")
+                request_args = {"model": model_name, "input": prompt}
                 if system_instruction:
                     request_args["instructions"] = system_instruction
-
-                response = openai_client.responses.create(
-                    **request_args
-                )
-
-                if response and response.output_text:
-
-                    print(
-                        f"[AI] OpenAI succeeded: {model_name}"
-                    )
-
-                    return {
-                        "text": response.output_text,
-                        "provider": "OpenAI",
-                        "model": model_name
-                    }
-
+                response = openai_client.responses.create(**request_args)
+                candidate = (getattr(response, "output_text", "") or "").strip()
+                if candidate:
+                    print(f"[AI] OpenAI succeeded: {model_name}")
+                    return {"text": candidate, "provider": "OpenAI", "model": model_name}
+                last_error = RuntimeError(f"OpenAI model {model_name} returned an empty response")
             except Exception as error:
-
                 last_error = error
-
-                print(
-                    f"[AI] OpenAI failed: {model_name}"
-                )
-                print(error)
-
-                continue
-
+                print(f"[AI] OpenAI failed: {model_name}: {error}")
     else:
-
-        print(
-            "[AI] OPENAI_API_KEY is not configured; "
-            "skipping OpenAI fallback."
-        )
-
-    # --------------------------------------------------------
-    # 3. ALL TEXT MODELS FAILED
-    # --------------------------------------------------------
+        print("[AI] Optional OpenAI fallback disabled or OPENAI_API_KEY missing.")
 
     if last_error:
         raise last_error
-
-    raise RuntimeError(
-        "All configured AI models are currently unavailable."
-    )
+    raise RuntimeError("All configured AI providers are unavailable. Check API keys and provider quotas.")
 
 
 # ============================================================
@@ -604,6 +699,672 @@ def test_api():
         "message":
             "Hello from the StudyFlow AI backend!"
     })
+
+
+# ============================================================
+# AUDIO / VIDEO TRANSCRIPTION
+# ============================================================
+
+TRANSCRIPTION_ALLOWED_EXTENSIONS = {
+    "mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg", "flac"
+}
+# Groq multilingual Whisper models. These are API models, not guaranteed
+# unlimited-free models; the account's free-tier quota and file-size cap apply.
+GROQ_TRANSCRIPTION_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GROQ_TRANSCRIPTION_MODELS",
+        "whisper-large-v3-turbo,whisper-large-v3",
+    ).split(",")
+    if model.strip()
+]
+# OpenAI transcription is an optional paid fallback, disabled by default.
+TRANSCRIPTION_MODELS = [
+    model.strip()
+    for model in os.getenv("OPENAI_TRANSCRIPTION_MODELS", "gpt-4o-mini-transcribe,whisper-1").split(",")
+    if model.strip()
+]
+AUDIO_MIME_TYPES = {
+    "mp3": "audio/mpeg",
+    "mpga": "audio/mpeg",
+    "mp4": "video/mp4",
+    "mpeg": "video/mpeg",
+    "m4a": "audio/mp4",
+    "wav": "audio/wav",
+    "webm": "audio/webm",
+    "ogg": "audio/ogg",
+    "flac": "audio/flac",
+}
+MAX_TRANSCRIPTION_UPLOAD_SIZE = MAX_UPLOAD_SIZE  # Maximum audio/video file size: 100 MiB.
+
+# A verbatim speech-to-text engine must never translate or romanize.
+TRANSCRIPTION_SYSTEM_INSTRUCTION = (
+    "You are a verbatim speech-to-text engine. You always transcribe speech "
+    "in the exact language that was spoken and you always write it in that "
+    "language's native script. You never translate, romanize, summarize, "
+    "paraphrase or comment. You ignore all non-speech sounds."
+)
+
+# Native-script hints keep languages such as Urdu out of Latin transliteration.
+# The wording is deliberately explicit because models tend to drift from Urdu
+# into Hindi (Devanagari) or Latin transliteration unless told otherwise.
+NATIVE_SCRIPT_HINTS = {
+    "urdu": (
+        "Urdu written in the Urdu (Nastaliq/Arabic) script, for example اردو. "
+        "Urdu is NOT Hindi and must NEVER be written in Devanagari/Hindi script "
+        "or in Latin (Roman) letters"
+    ),
+    "arabic": "the Arabic script, for example العربية",
+    "persian": "the Persian (Arabic) script, for example فارسی",
+    "pashto": "the Pashto (Arabic) script",
+    "sindhi": "the Sindhi (Arabic) script",
+    "punjabi": "the Shahmukhi (Arabic) script for Punjabi, not Gurmukhi",
+    "dari": "the Dari (Arabic) script",
+    "hindi": "the Devanagari script, for example हिन्दी",
+    "bengali": "the Bengali script",
+    "russian": "the Cyrillic script",
+    "ukrainian": "the Cyrillic script",
+    "hebrew": "the Hebrew script",
+    "greek": "the Greek script",
+    "thai": "the Thai script",
+    "tamil": "the Tamil script",
+    "telugu": "the Telugu script",
+    "chinese": "Chinese characters",
+    "japanese": "Japanese script",
+    "korean": "Hangul",
+}
+
+# Scripts that share the same spoken language family can be confused for one
+# another. Urdu and Hindi are the same spoken language (Hindustani) but use
+# completely different scripts, so the script of the transcript is checked and
+# repaired when it does not match the requested language.
+SCRIPT_CHARACTER_RANGES = {
+    "arabic": r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]",
+    "devanagari": r"[\u0900-\u097F]",
+    "gurmukhi": r"[\u0A00-\u0A7F]",
+    "bengali": r"[\u0980-\u09FF]",
+    "cyrillic": r"[\u0400-\u04FF]",
+    "hebrew": r"[\u0590-\u05FF]",
+    "greek": r"[\u0370-\u03FF]",
+    "thai": r"[\u0E00-\u0E7F]",
+    "tamil": r"[\u0B80-\u0BFF]",
+    "telugu": r"[\u0C00-\u0C7F]",
+    "cjk": r"[\u4E00-\u9FFF]",
+    "japanese": r"[\u3040-\u30FF]",
+    "hangul": r"[\uAC00-\uD7AF]",
+}
+
+# The script a language must be written in. Languages that use the Latin
+# alphabet are intentionally absent, meaning "no repair needed".
+LANGUAGE_SCRIPT = {
+    "urdu": "arabic",
+    "arabic": "arabic",
+    "persian": "arabic",
+    "pashto": "arabic",
+    "sindhi": "arabic",
+    "dari": "arabic",
+    "kashmiri": "arabic",
+    "balochi": "arabic",
+    "punjabi": "arabic",  # Shahmukhi is the Urdu-script form of Punjabi
+    "hindi": "devanagari",
+    "bengali": "bengali",
+    "russian": "cyrillic",
+    "ukrainian": "cyrillic",
+    "hebrew": "hebrew",
+    "greek": "greek",
+    "thai": "thai",
+    "tamil": "tamil",
+    "telugu": "telugu",
+    "chinese": "cjk",
+    "japanese": "japanese",
+    "korean": "hangul",
+}
+
+
+def build_transcription_prompt(language_hint=None):
+    """Transcribe multilingual audio without translating or changing scripts."""
+    lines = [
+        "Transcribe all spoken words in this audio verbatim.",
+        "This recording may contain multiple languages, including Urdu, Arabic, and English.",
+        "Detect language changes throughout the recording, not just at the beginning.",
+        "Preserve each language in its original spoken language and native writing system.",
+        "Write Urdu in Urdu script, Arabic in Arabic script, and English in Latin letters.",
+        "For English mixed with Urdu, keep English words in English letters and Urdu words in Urdu script.",
+        "For Urdu mixed with Arabic, keep Urdu and Arabic words in their respective original scripts.",
+        "Do not translate, romanize, transliterate, summarize, or paraphrase.",
+        "Do not convert Urdu into Hindi or Hindi into Urdu.",
+        "Do not force all words into one language or one writing system.",
+        "Preserve the original order of speech, including code-switching and sentences containing multiple languages.",
+        "Output ONLY the transcript text, with no headings, language labels, translations, timestamps, or commentary.",
+        "Ignore music, humming, instrumental audio, and other non-speech sounds.",
+        "Do not include labels such as [Music], [Applause], or [Silence].",
+        "If there are two speakers in the audio then write it as [Speaker 1] or [Speaker 2] before the dialouge or talk respectively",
+        "If there is no intelligible speech, return an empty response.",
+    ]
+
+    # Apply a language-specific hint only when the caller explicitly supplies one.
+    # In automatic mode, leave language_hint empty so mixed languages are preserved.
+    if language_hint and language_hint in NATIVE_SCRIPT_HINTS:
+        script = NATIVE_SCRIPT_HINTS[language_hint]
+        lines.insert(
+            1,
+            f"The user selected {language_hint}; write that language in {script}. "
+            "Still preserve any other languages in the recording in their own scripts.",
+        )
+
+    return "\n".join(lines)
+
+
+# Spoken-language detection is used to lock the transcript language. Without
+# it a model can "helpfully" translate a non-English lecture into English.
+AUDIO_LANGUAGE_PROMPT = (
+    "Identify the language being spoken in this audio. "
+    "Reply with ONLY the English name of that language in lowercase, "
+    "for example: urdu, arabic, english, hindi, punjabi, persian, pashto, "
+    "sindhi, spanish, french, bengali, turkish. "
+    "Note: Urdu and Hindi are the same spoken language (Hindustani). "
+    "Choose 'urdu' when the speaker uses Urdu words and Urdu pronunciation "
+    "(for example Alhamdulillah, Allah, karam, faiz), and 'hindi' only when "
+    "the speaker clearly uses Hindi/Sanskrit vocabulary. "
+    "If the audio contains no speech at all, reply with: none"
+)
+
+NO_SPEECH_TOKENS = {"none", "no", "silence", "music", "unknown", "noise", "instrumental"}
+
+# Common spoken-language names, used to parse the model's detection reply.
+KNOWN_SPOKEN_LANGUAGES = set(NATIVE_SCRIPT_HINTS) | {
+    "english", "spanish", "french", "german", "italian", "portuguese",
+    "dutch", "turkish", "indonesian", "malay", "swahili", "vietnamese",
+    "polish", "romanian", "czech", "swedish", "norwegian", "danish",
+    "finnish", "kannada", "malayalam", "marathi", "gujarati", "odia",
+}
+
+# Words that frequently appear in a detection sentence but are not languages.
+LANGUAGE_REPLY_STOPWORDS = {
+    "the", "language", "is", "this", "audio", "spoken", "in", "a", "an",
+    "detected", "it", "appears", "to", "be", "speech", "contains", "no",
+    "i", "cannot", "determine", "sounds", "like", "with", "and", "only",
+    "clip", "recording", "voice", "speaker", "says", "of", "at",
+}
+
+# Markers such as [Music], (music), musical-note symbols or standalone sound
+# descriptions are removed so the transcript never mentions music or noise.
+NON_SPEECH_PATTERNS = [
+    re.compile(
+        r"\[\s*(?:music|musique|instrumental|instrumental music|background music|"
+        r"applause|clapping|cheering|laughter|laughs|chuckles|sighs|coughing|cough|"
+        r"sneezes|sniffing|silence|inaudible|indistinct|noise|noises|background|"
+        r"beep|beeps|intro|outro|sound|sounds|sound effect|sound effects|audio|"
+        r"birds|wind|rain|footsteps|door|phone)[^\]]*\]",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\(\s*(?:music|musique|instrumental|background music|applause|clapping|"
+        r"cheering|laughter|laughs|silence|inaudible|noise|background|sound effect|"
+        r"sound effects)[^\)]*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"[♪♫♬♩🎵🎶]+"),
+    re.compile(
+        r"^\s*(?:music|musique|instrumental|applause|laughter|silence|inaudible|"
+        r"background music|sound effect)\s*[.!]?\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+]
+
+
+def clean_transcript_text(text):
+    """Remove non-speech markers (especially music) and tidy whitespace."""
+    if not text:
+        return ""
+
+    cleaned = text
+    for pattern in NON_SPEECH_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned)
+
+    cleaned = re.sub(r"[ \t\u00A0]{2,}", " ", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+    cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+
+    return cleaned.strip()
+
+
+# Languages that must be written in a specific (non-Latin) script. When the
+# model writes them in the wrong script (Urdu in Devanagari, or any of them in
+# Latin letters) the transcript is repaired by rewriting it into the native
+# script of the spoken language.
+NATIVE_SCRIPT_LANGUAGES = set(NATIVE_SCRIPT_HINTS)
+
+
+def count_latin_letters(text):
+    return len(re.findall(r"[A-Za-z\u00C0-\u024F]", text))
+
+
+def count_script_letters(text):
+    """Count letters that belong to any non-Latin script we track."""
+    total = 0
+    for pattern in SCRIPT_CHARACTER_RANGES.values():
+        total += len(re.findall(pattern, text))
+    return total
+
+
+def is_latin_dominant(text):
+    """True when a transcript is written mostly with Latin letters."""
+    latin_count = count_latin_letters(text)
+    other_script_count = count_script_letters(text)
+    total_letters = latin_count + other_script_count
+    if total_letters == 0:
+        return False
+    return latin_count > 0 and latin_count >= total_letters * 0.6
+
+
+def text_matches_language_script(text, language):
+    """
+    True when the text is written in the script expected for the language.
+
+    For languages that use the Latin alphabet (or are unknown) there is no
+    script constraint, so this returns True.
+    """
+    expected_script = LANGUAGE_SCRIPT.get(language)
+    if not expected_script:
+        return True
+
+    expected_count = len(
+        re.findall(SCRIPT_CHARACTER_RANGES[expected_script], text)
+    )
+    latin_count = count_latin_letters(text)
+    other_script_count = count_script_letters(text) - expected_count
+
+    relevant = expected_count + latin_count + other_script_count
+    if relevant == 0:
+        return True
+
+    # The expected script must clearly dominate; otherwise it is the wrong
+    # script (for example Urdu written in Devanagari or in Latin letters).
+    return expected_count >= relevant * 0.6
+
+
+def rewrite_transcript_to_native_script(text, language):
+    """
+    Repair a transcript written in the wrong script (translated, romanized or
+    written in a sibling script such as Hindi/Devanagari) by rewriting it into
+    the native script of the spoken language. Falls back to the original text
+    when the rewrite fails.
+    """
+    if not text or language not in NATIVE_SCRIPT_LANGUAGES:
+        return text
+
+    if text_matches_language_script(text, language):
+        return text
+
+    script = NATIVE_SCRIPT_HINTS.get(language, language)
+    system_instruction = (
+        "You are a verbatim transcriber. You convert text into the native "
+        "script of its language without changing a single word, adding any "
+        "word, translating, or adding labels."
+    )
+    prompt = (
+        f"The text below is spoken {language} but it was written in the wrong "
+        "script (Latin letters or a different language's script such as Hindi).\n\n"
+        f"Rewrite it EXACTLY into {script}, keeping every word and its order.\n"
+        "Rules: Do not translate. Do not change the vocabulary or word order. "
+        "Do not add or remove any word. "
+        "Do not add any label, note or sound description. "
+        f"The output must be {language} only. "
+        "Return only the rewritten text.\n\n"
+        f"{text}"
+    )
+
+    try:
+        result = generate_ai_response(
+            prompt=prompt,
+            system_instruction=system_instruction,
+            temperature=0
+        )
+        rewritten = clean_transcript_text((result.get("text") or "").strip())
+        if rewritten and text_matches_language_script(rewritten, language):
+            return rewritten
+    except Exception as error:
+        print("[Transcription] Native-script repair failed:", error)
+
+    return text
+
+
+def resolve_audio_mime(filename, fallback=None):
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return AUDIO_MIME_TYPES.get(extension, fallback or "application/octet-stream")
+
+
+def detect_audio_language(file_bytes, mime_type):
+    """
+    Ask the AI to identify the spoken language before transcribing.
+
+    Returns a lowercase language name, or an empty string when the language
+    cannot be determined (for example when the clip holds only music).
+    """
+    for model_name in GEMINI_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                    AUDIO_LANGUAGE_PROMPT,
+                ],
+                config=types.GenerateContentConfig(temperature=0),
+            )
+            raw = (getattr(response, "text", "") or "").strip().lower()
+            tokens = re.findall(r"[a-z]+", raw)
+            if not tokens:
+                continue
+
+            # "no speech" / "none" / "music only" mean there is nothing to transcribe.
+            if tokens == ["no"] or "none" in tokens or "silence" in tokens:
+                return ""
+            if "no" in tokens and "speech" in tokens:
+                return ""
+
+            name = ""
+            for token in reversed(tokens):
+                if token in KNOWN_SPOKEN_LANGUAGES:
+                    name = token
+                    break
+            if not name:
+                candidates = [
+                    token for token in tokens
+                    if token not in LANGUAGE_REPLY_STOPWORDS
+                    and token not in NO_SPEECH_TOKENS
+                ]
+                if len(candidates) == 1:
+                    name = candidates[0]
+
+            if not name or name in NO_SPEECH_TOKENS:
+                return ""
+            return name
+        except Exception as error:
+            print(f"[Transcription] Language detection failed ({model_name}):", error)
+
+    return ""
+
+
+def transcribe_with_gemini(file_bytes, mime_type, language_hint=None, filename="audio_upload"):
+    """Transcribe with an ordered Gemini fallback chain.
+
+    Small audio files are sent inline. Files larger than 20 MiB are uploaded
+    through Gemini Files API first, avoiding oversized inline API requests.
+    The same uploaded file is reused across model retries and then deleted.
+    """
+    last_error = None
+    prompt_text = build_transcription_prompt(language_hint)
+    uploaded_file = None
+    temp_path = None
+    contents_audio = None
+
+    try:
+        if len(file_bytes) > 20 * 1024 * 1024:
+            suffix = os.path.splitext(filename)[1] or ".audio"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(file_bytes)
+                temp_path = temp_file.name
+
+            print(
+                f"[Transcription] Uploading large file ({len(file_bytes) / (1024 * 1024):.1f} MiB) "
+                "to Gemini Files API."
+            )
+            # Upload by path so the SDK can stream the file instead of placing
+            # the full payload into an inline generate_content request.
+            uploaded_file = client.files.upload(
+                file=temp_path,
+                config=types.UploadFileConfig(
+                    mime_type=mime_type,
+                    display_name=os.path.basename(filename),
+                ),
+            )
+            contents_audio = uploaded_file
+        else:
+            contents_audio = types.Part.from_bytes(
+                data=file_bytes,
+                mime_type=mime_type,
+            )
+
+        for model_name in GEMINI_MODELS:
+            try:
+                print(f"[Transcription] Trying Gemini model: {model_name}")
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[contents_audio, prompt_text],
+                    config=types.GenerateContentConfig(
+                        temperature=0,
+                        system_instruction=TRANSCRIPTION_SYSTEM_INSTRUCTION,
+                    ),
+                )
+                candidate = (getattr(response, "text", "") or "").strip()
+                if candidate:
+                    print(f"[Transcription] Gemini succeeded: {model_name}")
+                    return candidate
+                print(f"[Transcription] Gemini model {model_name} returned an empty transcript; trying next model.")
+            except Exception as error:
+                last_error = error
+                print(f"[Transcription] Gemini model {model_name} failed: {error}")
+                continue
+
+        if last_error:
+            raise last_error
+        return ""
+    finally:
+        if uploaded_file is not None:
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception as cleanup_error:
+                print("[Transcription] Could not delete temporary Gemini file:", cleanup_error)
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError as cleanup_error:
+                print("[Transcription] Could not remove temporary upload:", cleanup_error)
+
+
+def transcribe_with_groq(file_bytes, filename, mime_type, language_hint=None):
+    """Transcribe multilingual audio using Groq Whisper models."""
+    if groq_client is None:
+        return ""
+
+    # Groq documents a 25 MB maximum upload for its free tier. Skip rather than
+    # wasting time retrying a file that cannot fit; Gemini may accept up to 100 MB.
+    groq_max_bytes = int(os.getenv("GROQ_TRANSCRIPTION_MAX_BYTES", str(25 * 1024 * 1024)))
+    if len(file_bytes) > groq_max_bytes:
+        raise ValueError(
+            "This file exceeds the configured Groq transcription upload limit "
+            f"({groq_max_bytes // (1024 * 1024)} MB). Gemini was tried first; "
+            "use a smaller file or configure a larger eligible Groq limit."
+        )
+
+    last_error = None
+    prompt_text = build_transcription_prompt(language_hint)
+    for model_name in GROQ_TRANSCRIPTION_MODELS:
+        try:
+            print(f"[Transcription] Trying Groq model: {model_name}")
+            transcription = groq_client.audio.transcriptions.create(
+                model=model_name,
+                file=(filename, io.BytesIO(file_bytes), mime_type),
+                prompt=prompt_text[:800],
+                temperature=0.0,
+            )
+            candidate = (getattr(transcription, "text", "") or "").strip()
+            if candidate:
+                print(f"[Transcription] Groq succeeded: {model_name}")
+                return candidate
+            last_error = RuntimeError(f"Groq model {model_name} returned an empty transcript")
+        except Exception as error:
+            last_error = error
+            print(f"[Transcription] Groq model {model_name} failed: {error}")
+
+    if last_error:
+        raise last_error
+    return ""
+
+
+def transcribe_with_openai(file_bytes, filename, mime_type, language_hint=None):
+    """Transcribe audio using OpenAI only when paid fallback is enabled."""
+    if openai_client is None:
+        return ""
+    last_error = None
+    prompt_text = build_transcription_prompt(language_hint)
+
+    for model_name in TRANSCRIPTION_MODELS:
+        try:
+            transcription = openai_client.audio.transcriptions.create(
+                model=model_name,
+                file=(filename, io.BytesIO(file_bytes), mime_type),
+                prompt=prompt_text,
+            )
+            candidate = (getattr(transcription, "text", "") or "").strip()
+            if candidate:
+                return candidate
+        except Exception as error:
+            last_error = error
+            print(f"[Transcription] OpenAI model {model_name} failed:", error)
+
+    if last_error:
+        raise last_error
+    return ""
+
+
+@app.route("/api/transcribe", methods=["POST", "OPTIONS"])
+def transcribe_lecture():
+    """Transcribe speech, then reuse the existing text language detector."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    uploaded_file = request.files.get("file")
+    if not uploaded_file or not uploaded_file.filename:
+        return jsonify({"success": False, "error": "Choose an audio or video file first."}), 400
+
+    filename = os.path.basename(uploaded_file.filename)
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension not in TRANSCRIPTION_ALLOWED_EXTENSIONS:
+        return jsonify({
+            "success": False,
+            "error": "Unsupported format. Use MP3, MP4, MPEG, M4A, WAV, WebM, OGG or FLAC."
+        }), 400
+
+    try:
+        file_bytes = uploaded_file.read(MAX_TRANSCRIPTION_UPLOAD_SIZE + 1)
+        if not file_bytes:
+            return jsonify({"success": False, "error": "The selected file is empty."}), 400
+        if len(file_bytes) > MAX_TRANSCRIPTION_UPLOAD_SIZE:
+            return jsonify({
+                "success": False,
+                "error": "This audio/video file is larger than the 100 MB upload limit."
+            }), 413
+
+        mime_type = resolve_audio_mime(filename, uploaded_file.mimetype)
+        transcript_text = ""
+        provider = None
+        errors = []
+
+        # Auto-detect mode must not lock every segment to the language
+        # detected in the first segment. The transcription prompt supports
+        # English + Urdu, Urdu + Arabic, and other language combinations.
+        language_hint = (request.form.get("language") or "auto").strip().lower()
+        language_hint = re.sub(r"[^a-z ]", "", language_hint).strip()
+
+        if language_hint in {"", "auto", "mixed", "unknown", "none", "no"}:
+            audio_language = ""
+            hint = None
+        elif language_hint in NATIVE_SCRIPT_HINTS or language_hint == "english":
+            audio_language = language_hint
+            hint = language_hint
+        else:
+            audio_language = ""
+            hint = None
+
+        # Gemini is tried first. Groq Whisper is the multilingual transcription
+        # fallback. OpenAI transcription is optional and disabled by default.
+        try:
+            transcript_text = transcribe_with_gemini(file_bytes, mime_type, hint, filename)
+            if transcript_text:
+                provider = "Gemini"
+        except Exception as error:
+            errors.append(f"Gemini: {error}")
+
+        if not transcript_text and groq_client is not None:
+            try:
+                transcript_text = transcribe_with_groq(file_bytes, filename, mime_type, hint)
+                if transcript_text:
+                    provider = "Groq"
+            except Exception as error:
+                errors.append(f"Groq: {error}")
+
+        if not transcript_text and openai_client is not None:
+            try:
+                transcript_text = transcribe_with_openai(file_bytes, filename, mime_type, hint)
+                if transcript_text:
+                    provider = "OpenAI"
+            except Exception as error:
+                errors.append(f"OpenAI: {error}")
+
+        if not transcript_text:
+            if errors:
+                return jsonify({
+                    "success": False,
+                    "error": "Transcription failed on the server. Check the Vercel function logs for details.",
+                    "details": " | ".join(errors)[:400]
+                }), 500
+
+            return jsonify({
+                "success": False,
+                "error": "No speech could be transcribed from this file."
+            }), 422
+
+        # Drop non-speech markers such as [Music] so music is never reported.
+        transcript_text = clean_transcript_text(transcript_text)
+
+        if not transcript_text:
+            return jsonify({
+                "success": False,
+                "error": "No speech could be transcribed from this file."
+            }), 422
+
+        # A model sometimes romanizes or translates non-Latin speech (for
+        # example writing Urdu in Latin letters). Rewrite it into the native
+        # script of the language that was actually spoken.
+        # Only run whole-transcript script repair for an explicitly selected
+        # single language. Never rewrite an auto-detected multilingual transcript
+        # (for example English + Urdu) into one script.
+        if hint and audio_language in NATIVE_SCRIPT_LANGUAGES:
+            transcript_text = rewrite_transcript_to_native_script(
+                transcript_text, audio_language
+            )
+
+        # Reuse the same language detector and normalizer as study materials.
+        detected_language = detect_language(transcript_text)
+        language = normalize_detected_language(detected_language, transcript_text)
+
+        # If the spoken language uses a non-Latin script (Urdu, Arabic, Hindi,
+        # ...) but the detector could not read the script, trust the audio
+        # detection so a translated or romanized transcript is still labelled
+        # in its true language.
+        if audio_language and audio_language in NATIVE_SCRIPT_HINTS and language in {"english", "unknown"}:
+            language = audio_language
+        elif language == "unknown" and audio_language:
+            language = audio_language
+
+        return jsonify({
+            "success": True,
+            "filename": filename,
+            "provider": provider,
+            "language": language,
+            "transcript": transcript_text,
+            "characters": len(transcript_text),
+            "translated": False
+        })
+    except Exception as error:
+        print("Transcription error:", error)
+        return jsonify({
+            "success": False,
+            "error": "Could not transcribe this file.",
+            "details": str(error)[:400]
+        }), 500
 
 
 # ============================================================
@@ -708,7 +1469,7 @@ def process_material():
                             "success": False,
                             "error": (
                                 f"Image '{filename}' is too large. "
-                                "Please upload an image smaller than 15 MB."
+                                "Please upload an image no larger than 100 MB."
                             )
                         }), 400
 
@@ -719,7 +1480,7 @@ def process_material():
                     image_text = ""
                     last_image_error = None
 
-                    for model_name in GEMINI_MODELS:
+                    for model_name in GEMINI_MODELS[:2]:
                         try:
                             print(
                                 f"Trying image model: {model_name} "
@@ -838,26 +1599,8 @@ def process_material():
                 "error": "Could not create text chunks."
             }), 400
 
-        # ====================================================
-        # CREATE EMBEDDINGS
-        # ====================================================
-
-        embeddings = create_embeddings(chunks)
-
-        if not embeddings:
-            return jsonify({
-                "success": False,
-                "error": "Could not create study material embeddings."
-            }), 500
-
-        # ====================================================
-        # SAVE MATERIAL
-        # ====================================================
-
-        material_store["text"] = text
-        material_store["language"] = language
-        material_store["chunks"] = chunks
-        material_store["embeddings"] = embeddings
+        # No remote embedding call is required. Generation requests carry
+        # their own extracted text and use fast local retrieval.
 
         # ====================================================
         # RESPONSE
@@ -871,7 +1614,9 @@ def process_material():
             "file_count": len(filenames),
             "characters": len(text),
             "language": language,
-            "chunks": len(chunks)
+            "chunks": len(chunks),
+            # Send the full bounded material back to the authenticated frontend.
+            "materialText": text[:int(os.getenv("MAX_MATERIAL_CHARS", "120000"))]
         })
 
     except Exception as error:
@@ -942,11 +1687,15 @@ def generate_result():
             }), 400
 
 
+        material = resolve_request_material(data)
+        if not material:
+            return jsonify({"success": False, "error": "Please upload or paste study material first."}), 400
+
         # ====================================================
         # CHECK MATERIAL
         # ====================================================
 
-        if not material_store["chunks"]:
+        if not material["chunks"]:
 
             return jsonify({
                 "success": False,
@@ -994,9 +1743,9 @@ def generate_result():
 
         retrieved = retrieve_chunks(
 
-            material_store["chunks"],
+            material["chunks"],
 
-            material_store["embeddings"],
+            material["embeddings"],
 
             query,
 
@@ -1028,7 +1777,7 @@ def generate_result():
         # LANGUAGE
         # ====================================================
 
-        language = material_store["language"]
+        language = material["language"]
 
 
         if language == "arabic":
@@ -1331,15 +2080,11 @@ def generate_flashcards():
         # Keep the endpoint predictable and protect token usage.
         count = max(5, min(count, 20))
 
-        if not material_store["chunks"]:
-            return jsonify({
-                "success": False,
-                "error": (
-                    "Please upload or paste study material first."
-                )
-            }), 400
+        material = resolve_request_material(data)
+        if not material:
+            return jsonify({"success": False, "error": "Please upload or paste study material first."}), 400
 
-        language = material_store["language"]
+        language = material["language"]
 
         if language == "arabic":
             language_rule = """
@@ -1374,8 +2119,8 @@ Do not unnecessarily translate the source.
         )
 
         retrieved = retrieve_chunks(
-            material_store["chunks"],
-            material_store["embeddings"],
+            material["chunks"],
+            material["embeddings"],
             query,
             top_k=min(10, max(6, count))
         )
@@ -1550,15 +2295,13 @@ def generate_test_concepts():
         except (TypeError, ValueError):
             count = 30
 
-        count = max(25, min(count, 30))
+        # A smaller default produces results faster and uses fewer tokens.
+        count = max(5, min(count, 20))
+        material = resolve_request_material(data)
+        if not material:
+            return jsonify({"success": False, "error": "Please upload or paste study material first."}), 400
 
-        if not material_store["chunks"]:
-            return jsonify({
-                "success": False,
-                "error": "Please upload or paste study material first."
-            }), 400
-
-        language = material_store.get("language", "english")
+        language = material.get("language", "english")
 
         language_rule = {
             "arabic": "Generate all questions and options in Arabic.",
@@ -1577,8 +2320,8 @@ def generate_test_concepts():
         )
 
         retrieved = retrieve_chunks(
-            material_store["chunks"],
-            material_store["embeddings"],
+            material["chunks"],
+            material["embeddings"],
             query,
             top_k=min(18, max(10, count // 2))
         )
@@ -1641,74 +2384,18 @@ Return ONLY the requested JSON array.
             temperature=0.25
         )
 
-        def extract_json_array(response_text):
-            """Extract and parse a JSON array from an AI response."""
-            candidate = (response_text or "").strip()
-            candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
-            candidate = re.sub(r"\s*```$", "", candidate).strip()
-            first = candidate.find("[")
-            last = candidate.rfind("]")
-            if first < 0 or last <= first:
-                raise ValueError("No JSON array found in AI response")
-            candidate = candidate[first:last + 1]
-            # Safe cleanup for the common trailing-comma error.
-            candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
-            parsed = json.loads(candidate)
-            if not isinstance(parsed, list):
-                raise ValueError("AI response was not a JSON array")
-            return parsed
+        raw = ai_result["text"].strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw).strip()
 
-        raw = ai_result.get("text", "")
-        try:
-            questions = extract_json_array(raw)
-        except (json.JSONDecodeError, ValueError):
-            # First fallback: ask the configured model to repair its own output.
-            # Keep the repair response isolated and validate it before use.
-            try:
-                repair_result = generate_ai_response(
-                    prompt=(
-                        "Convert the content below into a valid JSON array of MCQ objects. "
-                        "Each object must contain question, options (exactly four strings), "
-                        "and answer (exactly matching one option). Preserve the meaning. "
-                        "Escape any quotation marks inside strings. Remove trailing commas. "
-                        "Return only JSON, without Markdown or commentary.\n\n"
-                        "Content to repair:\n" + str(raw)[:18000]
-                    ),
-                    system_instruction=(
-                        "You are a strict JSON formatter. Output one valid JSON array only. "
-                        "Use double quotes for all keys and strings. Do not include commentary."
-                    ),
-                    temperature=0
-                )
-                questions = extract_json_array(repair_result.get("text", ""))
-            except Exception:
-                # Second fallback: regenerate a clean, compact response instead of
-                # exposing a variable JSON line/column error to the user.
-                retry_result = generate_ai_response(
-                    prompt=(
-                        f"Create exactly {count} multiple-choice questions using only this study material.\n"
-                        f"Detected language: {language}.\n"
-                        "Return a valid JSON array only. Every object must have exactly these keys: "
-                        '"question", "options", "answer". "options" must be an array of exactly '
-                        "four distinct strings. "
-                        '"answer" must exactly match one of the four options. Do not use quotation '
-                        "marks inside question or option text; avoid commas after the last item.\n\n"
-                        "Study material:\n" + context[:14000]
-                    ),
-                    system_instruction=(
-                        "Output only syntactically valid JSON. No Markdown fences, no extra text, "
-                        "no trailing commas. Keep each question and option concise."
-                    ),
-                    temperature=0
-                )
-                try:
-                    questions = extract_json_array(retry_result.get("text", ""))
-                except Exception as final_error:
-                    print("Test concepts JSON parsing failed after retries:", str(final_error))
-                    raise ValueError(
-                        "The AI returned an invalid exam format after automatic retries. "
-                        "Please try again; if it continues, reduce the number of questions or upload clearer material."
-                    ) from None
+        start = raw.find("[")
+        end = raw.rfind("]")
+
+        if start == -1 or end <= start:
+            raise ValueError("The AI returned an invalid test format.")
+
+        import json
+        questions = json.loads(raw[start:end + 1])
 
         if not isinstance(questions, list):
             raise ValueError("The AI did not return a question list.")
@@ -1826,19 +2513,9 @@ def chat_with_material():
             }), 400
 
 
-        # ====================================================
-        # CHECK MATERIAL
-        # ====================================================
-
-        if not material_store["chunks"]:
-
-            return jsonify({
-                "success": False,
-                "error": (
-                    "Please upload or paste study "
-                    "material before using the chatbot."
-                )
-            }), 400
+        material = resolve_request_material(data)
+        if not material:
+            return jsonify({"success": False, "error": "Please upload or paste study material before using the chatbot."}), 400
 
 
         # ====================================================
@@ -1867,9 +2544,9 @@ def chat_with_material():
 
         retrieved = retrieve_chunks(
 
-            material_store["chunks"],
+            material["chunks"],
 
-            material_store["embeddings"],
+            material["embeddings"],
 
             question,
 
@@ -1897,7 +2574,7 @@ def chat_with_material():
         # LANGUAGE
         # ====================================================
 
-        language = material_store["language"]
+        language = material["language"]
 
 
         if language == "arabic":
@@ -2188,10 +2865,7 @@ def generate_pdf_file():
 
         language = data.get(
             "language",
-            material_store.get(
-                "language",
-                "unknown"
-            )
+            "unknown"
         )
 
 
@@ -2297,19 +2971,14 @@ def oral_exam():
             raise ValueError("The AI response must be a JSON object.")
         return parsed
 
-    def oral_context(query):
-        """Retrieve relevant chunks before formatting context for the model."""
-        chunks = material_store.get("chunks") or []
-        if not chunks:
-            raise ValueError("Please upload or paste study material first.")
+    request_material = None
 
-        embeddings = material_store.get("embeddings") or []
-        retrieved = retrieve_chunks(
-            chunks,
-            embeddings,
-            query,
-            top_k=min(10, len(chunks))
-        )
+    def oral_context(query):
+        """Use the material supplied with the current request."""
+        if not request_material:
+            raise ValueError("Please upload or paste study material first.")
+        chunks = request_material["chunks"]
+        retrieved = retrieve_chunks(chunks, [], query, top_k=min(8, len(chunks)))
         return build_context(retrieved)
 
     try:
@@ -2321,14 +2990,11 @@ def oral_exam():
             }), 400
 
         action = str(data.get("action", "start")).strip().lower()
+        request_material = resolve_request_material(data)
+        if not request_material:
+            return jsonify({"success": False, "error": "Please upload or paste study material first."}), 400
 
-        if not material_store.get("chunks"):
-            return jsonify({
-                "success": False,
-                "error": "Please upload or paste study material first."
-            }), 400
-
-        language = material_store.get("language", "english")
+        language = request_material.get("language", "english")
         total_questions = 10
         language_rule = {
             "urdu": "Ask and evaluate in Urdu only.",
