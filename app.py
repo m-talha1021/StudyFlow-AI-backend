@@ -6,7 +6,7 @@ import json
 import urllib.request
 import urllib.error
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, g
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -1368,25 +1368,184 @@ def transcribe_lecture():
 
 
 # ============================================================
+# SUPABASE AUTH CONFIGURATION
+# ============================================================
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_PUBLISHABLE_KEY = (
+    os.getenv("SUPABASE_PUBLISHABLE_KEY")
+    or os.getenv("SUPABASE_ANON_KEY")
+    or ""
+).strip()
+
+
+def get_supabase_user(access_token):
+    """Validate a Supabase access token using Supabase Auth's user endpoint.
+
+    This avoids trusting an unverified JWT payload and supports projects using
+    Supabase's current signing-key configuration. The publishable/anon key is
+    safe for this request; never put a service-role key in the frontend.
+    """
+    if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are not configured.")
+
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "apikey": SUPABASE_PUBLISHABLE_KEY,
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        if error.code in (400, 401, 403):
+            return None
+        raise RuntimeError(f"Supabase Auth returned HTTP {error.code}.") from error
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise RuntimeError("Could not reach Supabase Auth to validate the session.") from error
+
+    if not isinstance(payload, dict) or not payload.get("id"):
+        return None
+    return payload
+
+
+# ============================================================
+# SUPABASE AUTHORIZATION FOR PRIVATE API ROUTES
+# ============================================================
+
+# These endpoints process a user's files, consume AI credits, or return
+# user-specific study results. They require a valid Supabase access token.
+# Public diagnostics, feedback, and CORS preflight requests remain public.
+PROTECTED_API_PATHS = {
+    "/api/transcribe",
+    "/api/material",
+    "/api/generate",
+    "/api/flashcards",
+    "/api/test-concepts",
+    "/api/generate-pdf",
+    "/api/oral-exam",
+}
+
+
+@app.before_request
+def enforce_supabase_authentication():
+    path = request.path.rstrip("/") or "/"
+
+    # Browser CORS preflight requests do not carry the user's bearer token.
+    if request.method == "OPTIONS":
+        return None
+
+    # Chat GET is intentionally a public deployment diagnostic; POST is private.
+    if path == "/api/chat" and request.method == "GET":
+        return None
+
+    if path not in PROTECTED_API_PATHS and not (path == "/api/chat" and request.method == "POST"):
+        return None
+
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, access_token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not access_token.strip():
+        return jsonify({
+            "success": False,
+            "error": "Authentication required. Please sign in again.",
+            "code": "AUTH_REQUIRED",
+        }), 401
+
+    try:
+        user = get_supabase_user(access_token.strip())
+    except RuntimeError:
+        app.logger.exception("Supabase token validation is temporarily unavailable.")
+        return jsonify({
+            "success": False,
+            "error": "Authentication service is temporarily unavailable. Please try again.",
+            "code": "AUTH_SERVICE_UNAVAILABLE",
+        }), 503
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "error": "Your session is invalid or expired. Please sign in again.",
+            "code": "INVALID_SESSION",
+        }), 401
+
+    g.supabase_user = user
+
+
+
+# ============================================================
 # AUTH / CORS DIAGNOSTIC
 # ============================================================
 
 @app.route("/api/auth/status", methods=["GET", "OPTIONS"])
 def auth_status():
-    """
-    Authentication is handled by Firebase on the frontend.
-    This endpoint is intentionally diagnostic only; it does not
-    create or store passwords.
-    """
+    """Report Supabase configuration and validate a supplied access token.
 
+    Protected API routes must explicitly call get_supabase_user() before
+    trusting a user ID. This diagnostic endpoint does not itself protect
+    other routes or create/store passwords.
+    """
     if request.method == "OPTIONS":
         return ("", 204)
 
+    configured = bool(SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY)
+    if not configured:
+        return jsonify({
+            "success": False,
+            "authentication": "Supabase Auth",
+            "configured": False,
+            "authenticated": False,
+            "backend_auth_required": False,
+            "message": "Set SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY in the backend environment."
+        }), 503
+
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+    if not token:
+        return jsonify({
+            "success": True,
+            "authentication": "Supabase Auth",
+            "configured": True,
+            "authenticated": False,
+            "backend_auth_required": False,
+            "message": "Supabase is configured. Send an access token as a Bearer token to validate a session."
+        })
+
+    try:
+        user = get_supabase_user(token)
+    except RuntimeError as error:
+        return jsonify({
+            "success": False,
+            "authentication": "Supabase Auth",
+            "configured": True,
+            "authenticated": False,
+            "error": str(error),
+        }), 502
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "authentication": "Supabase Auth",
+            "configured": True,
+            "authenticated": False,
+            "message": "The supplied access token is invalid or expired."
+        }), 401
+
     return jsonify({
         "success": True,
-        "authentication": "Firebase Authentication",
+        "authentication": "Supabase Auth",
+        "configured": True,
+        "authenticated": True,
+        "user": {
+            "id": user.get("id"),
+            "email": user.get("email"),
+        },
         "backend_auth_required": False,
-        "message": "Login and signup are handled by Firebase on the frontend."
     })
 
 
