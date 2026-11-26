@@ -338,7 +338,7 @@ def require_auth(route):
 # store (Firestore/Redis) is the Phase 2 upgrade if abuse becomes real.
 #
 # Limits (overridable by env var) — these are the FREE plan limits:
-#   QUOTA_GENERATION_PER_DAY              10 AI calls/day/user (material,
+#   QUOTA_GENERATION_PER_DAY              5 AI calls/day/user (material,
 #                                         generate, flashcards, test-concepts,
 #                                         chat, oral-exam, generate-pdf)
 #   QUOTA_TRANSCRIPTION_MINUTES_PER_DAY   20 audio minutes/day/user
@@ -354,7 +354,7 @@ def require_auth(route):
 # If Firestore is unavailable the plan lookup fails safe to "free" —
 # never fail open to unlimited.
 
-QUOTA_GENERATION_PER_DAY = int(os.getenv("QUOTA_GENERATION_PER_DAY", "10"))
+QUOTA_GENERATION_PER_DAY = int(os.getenv("QUOTA_GENERATION_PER_DAY", "5"))
 QUOTA_TRANSCRIPTION_MINUTES_PER_DAY = float(
     os.getenv("QUOTA_TRANSCRIPTION_MINUTES_PER_DAY", "20")
 )
