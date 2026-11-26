@@ -2745,6 +2745,335 @@ Return ONLY the JSON array requested above.
 
 
 # ============================================================
+# MIND MAP
+# CONCEPT TREE FROM STUDY MATERIAL
+# ============================================================
+
+def extract_json_object(raw_text):
+    """Extract one complete JSON object, tolerating fences and trailing commas."""
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raise ValueError("The AI returned an empty mind map response.")
+
+    candidate = raw_text.strip().lstrip("\ufeff")
+    candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\s*```$", "", candidate).strip()
+
+    # Locate the first object and find its matching closing brace without
+    # being confused by braces inside quoted label/detail text.
+    start_index = candidate.find("{")
+    if start_index < 0:
+        raise ValueError("The AI response did not contain a JSON mind map object.")
+
+    depth = 0
+    in_string = False
+    escaped = False
+    end_index = -1
+    for index in range(start_index, len(candidate)):
+        char = candidate[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end_index = index + 1
+                break
+
+    if end_index < 0:
+        raise ValueError("The AI response was incomplete or truncated before the JSON object finished.")
+
+    json_text = candidate[start_index:end_index]
+    # Models occasionally add a trailing comma before a closing bracket/brace.
+    json_text = re.sub(r",\s*([}\]])", r"\1", json_text)
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError as parse_error:
+        raise ValueError(
+            f"The AI returned malformed JSON near character {parse_error.pos}."
+        ) from parse_error
+
+    if isinstance(parsed, dict):
+        parsed = parsed.get("mindmap") or parsed.get("tree") or parsed.get("data") or parsed
+    if not isinstance(parsed, dict):
+        raise ValueError("The AI response did not contain a mind map object.")
+    return parsed
+
+
+def clean_mindmap_tree(raw_tree):
+    """Validate and clean an AI-generated mind map tree.
+
+    Enforces the shape the frontend renders: a root topic, at most 8 main
+    concepts, at most 4 levels deep, short labels and one short detail line
+    per node. Drops empty or malformed branches instead of failing outright,
+    but raises ValueError when too little usable structure survives.
+    """
+    max_depth = 4
+    max_children = 8
+    max_nodes = 80
+    max_label_chars = 80
+    max_detail_chars = 160
+
+    node_count = [0]
+
+    def clean_node(raw_node, depth):
+        if not isinstance(raw_node, dict):
+            return None
+        label = str(raw_node.get("label") or raw_node.get("topic") or "").strip()
+        if not label:
+            return None
+        label = label[:max_label_chars]
+        detail = str(raw_node.get("detail") or "").strip()
+        detail = detail[:max_detail_chars] if detail else ""
+        node_count[0] += 1
+        if node_count[0] > max_nodes:
+            return None
+        node = {"label": label}
+        if detail:
+            node["detail"] = detail
+        if depth < max_depth:
+            raw_children = raw_node.get("children") or []
+            if isinstance(raw_children, list):
+                children = []
+                for raw_child in raw_children:
+                    cleaned_child = clean_node(raw_child, depth + 1)
+                    if cleaned_child is not None:
+                        children.append(cleaned_child)
+                    if len(children) >= max_children:
+                        break
+                if children:
+                    node["children"] = children
+        return node
+
+    if not isinstance(raw_tree, dict):
+        raise ValueError("The AI did not return a mind map.")
+
+    topic = str(raw_tree.get("topic") or raw_tree.get("label") or "").strip()
+    if not topic:
+        raise ValueError("The AI did not return a mind map topic.")
+    topic = topic[:max_label_chars]
+
+    root = {"topic": topic}
+    raw_children = raw_tree.get("children") or []
+    if not isinstance(raw_children, list) or not raw_children:
+        raise ValueError("The AI did not return any main concepts for the mind map.")
+
+    children = []
+    for raw_child in raw_children:
+        cleaned_child = clean_node(raw_child, 2)
+        if cleaned_child is not None:
+            children.append(cleaned_child)
+        if len(children) >= max_children:
+            break
+
+    if len(children) < 2 or node_count[0] < 5:
+        raise ValueError(
+            "The AI did not generate enough valid concepts for a mind map. Please try again."
+        )
+
+    root["children"] = children
+    return root
+
+
+@app.route(
+    "/api/mindmap",
+    methods=["POST"]
+)
+@require_auth
+@enforce_generation_quota
+def generate_mindmap():
+    """
+    Generate a concept tree (mind map) from the current study material.
+    Returns a strict JSON tree the frontend renders as an interactive map.
+    Uses the same Gemini -> Groq -> OpenRouter fallback chain as the rest
+    of the application, and counts as one AI generation call.
+    """
+
+    try:
+        data = request.get_json(silent=True) or {}
+
+        material = resolve_request_material(data)
+        if not material:
+            return jsonify({"success": False, "error": "Please upload or paste study material first."}), 400
+
+        language = material["language"]
+
+        if language == "arabic":
+            language_rule = """
+Generate every label and detail in Arabic only.
+Do not translate the source material into English.
+"""
+        elif language == "urdu":
+            language_rule = """
+Generate every label and detail in Urdu only.
+Do not translate the source material into English.
+"""
+        elif language == "english":
+            language_rule = """
+Generate every label and detail in English only.
+"""
+        elif language == "mixed":
+            language_rule = """
+Use the same language style as the study material.
+Preserve Urdu, Arabic and English naturally where they
+appear in the source.
+"""
+        else:
+            language_rule = """
+Use the dominant language of the study material.
+Do not unnecessarily translate the source.
+"""
+
+        query = (
+            "Find the main topics, subtopics, key concepts, "
+            "definitions, processes and relationships that "
+            "structure this study material."
+        )
+
+        retrieved = retrieve_chunks(
+            material["chunks"],
+            material["embeddings"],
+            query,
+            top_k=8
+        )
+
+        context = build_context(retrieved)
+
+        if not context:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "Could not retrieve relevant study material "
+                    "for a mind map."
+                )
+            }), 500
+
+        instructions = f"""
+You are StudyFlow AI, an AI study assistant.
+
+Create a mind map (concept tree) from the provided study
+material.
+
+{language_rule}
+
+IMPORTANT:
+- Use ONLY information supported by the provided context.
+- Do not invent facts.
+- Do not use outside knowledge.
+- The central topic is the main subject of the material.
+- Create 6 to 8 main concepts directly under the central topic.
+- Each main concept may have up to 4 sub-concepts.
+- Sub-concepts may have up to 3 of their own children.
+- Keep the tree at most 4 levels deep including the central topic.
+- Every label must be short: a few words only.
+- Each node may have one short "detail" line (one sentence at most).
+- Do not repeat the same concept in different branches.
+- Return ONLY valid JSON.
+- Do not use Markdown code fences.
+- Do not add commentary before or after the JSON.
+
+Return exactly this structure:
+
+{{
+  "topic": "Central topic of the lecture",
+  "children": [
+    {{
+      "label": "Main concept",
+      "detail": "One short supporting line",
+      "children": [
+        {{
+          "label": "Sub-concept",
+          "detail": "One short supporting line",
+          "children": [
+            {{ "label": "Smaller idea" }}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}
+"""
+
+        prompt = f"""
+Study material context:
+
+--------------------
+
+{context}
+
+--------------------
+
+Detected source language:
+{language}
+
+Generate the mind map for this study material.
+Return ONLY the JSON object requested above.
+"""
+
+        # One corrective retry handles occasional provider formatting
+        # without changing the requested structure.
+        last_parse_error = None
+        ai_result = None
+        mindmap = None
+        for attempt in range(2):
+            request_prompt = prompt if attempt == 0 else (
+                prompt + "\n\nIMPORTANT: Your previous response was not valid complete JSON. "
+                "Return a complete JSON object only. Escape quotation marks inside strings, "
+                "do not use trailing commas, and include the full tree with 6 to 8 main concepts."
+            )
+            ai_result = generate_ai_response(
+                prompt=request_prompt,
+                system_instruction=instructions,
+                temperature=0.1 if attempt else 0.2
+            )
+            raw = ai_result.get("text", "") if isinstance(ai_result, dict) else str(ai_result)
+            try:
+                parsed = extract_json_object(raw)
+                mindmap = clean_mindmap_tree(parsed)
+                if mindmap:
+                    break
+            except (ValueError, TypeError) as parse_error:
+                last_parse_error = parse_error
+                if attempt == 1:
+                    raise ValueError(
+                        "The AI could not produce a valid mind map format after retry. Please try generating the mind map again."
+                    ) from parse_error
+
+        if not mindmap:
+            raise ValueError(
+                str(last_parse_error) if isinstance(last_parse_error, ValueError)
+                else "The AI did not generate a valid mind map. Please try again."
+            )
+
+        return jsonify({
+            "success": True,
+            "mindmap": mindmap,
+            "language": language,
+            "provider": ai_result["provider"],
+            "model": ai_result["model"]
+        })
+
+    except Exception as error:
+        print("Mind map error:", error)
+
+        return jsonify({
+            "success": False,
+            "error": (
+                str(error) if isinstance(error, ValueError)
+                else "Could not generate the mind map. Please try again."
+            )
+        }), 500
+
+
+# ============================================================
 # TEST CONCEPTS
 # TIMED MULTIPLE-CHOICE EXAM FROM STUDY MATERIAL
 # ============================================================
