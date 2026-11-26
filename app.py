@@ -1,12 +1,20 @@
 import os
 import io
 import re
+import base64
 import tempfile
+import threading
+import time
+import wave
 import json
 import urllib.request
 import urllib.error
 
-from flask import Flask, jsonify, request, send_file
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+
+from flask import Flask, g, jsonify, request, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -163,6 +171,331 @@ print(f"[Providers] OpenAI paid fallback enabled: {openai_client is not None}")
 
 
 # ============================================================
+# FIREBASE AUTHENTICATION (Phase 1 — launch blocker fix)
+# ============================================================
+# The backend used to accept unauthenticated calls to every /api/*
+# endpoint, so anyone who found the URL could spend the owner's
+# Gemini/Groq/OpenRouter quota. Every /api/* endpoint except /api/test
+# now requires a Firebase ID token (Authorization: Bearer <token>).
+#
+# Vercel needs ONE of these (names only — never commit values):
+#   FIREBASE_SERVICE_ACCOUNT         JSON service-account key, pasted as-is
+#   FIREBASE_SERVICE_ACCOUNT_BASE64  same JSON, base64-encoded (use this if
+#                                    pasting raw JSON into Vercel is awkward)
+# If neither is set, Application Default Credentials are tried
+# (GOOGLE_APPLICATION_CREDENTIALS, or the platform default). If no
+# credentials are available at all, auth stays disabled and every
+# protected endpoint answers 503 until the env var is set — the server
+# never silently runs unauthenticated.
+# Optional: FIREBASE_PROJECT_ID overrides the project used to verify tokens.
+
+try:
+    import firebase_admin
+    from firebase_admin import auth as firebase_auth
+    from firebase_admin import credentials as firebase_credentials
+    _FIREBASE_ADMIN_IMPORTED = True
+except ImportError:
+    firebase_admin = None
+    firebase_auth = None
+    firebase_credentials = None
+    _FIREBASE_ADMIN_IMPORTED = False
+
+FIREBASE_AUTH_ENABLED = False
+
+
+def _init_firebase_admin():
+    """Initialize Firebase Admin once at startup; never raise on import.
+
+    A missing service account must not crash the server — it must fail
+    closed per request (503) so the misconfiguration is visible.
+    """
+    global FIREBASE_AUTH_ENABLED
+    if not _FIREBASE_ADMIN_IMPORTED:
+        print("[Auth] firebase-admin is not installed; backend auth is DISABLED.")
+        return
+    try:
+        if not firebase_admin._apps:
+            credential = None
+            service_account_json = (os.getenv("FIREBASE_SERVICE_ACCOUNT") or "").strip()
+            service_account_b64 = (os.getenv("FIREBASE_SERVICE_ACCOUNT_BASE64") or "").strip()
+            if service_account_json:
+                credential = firebase_credentials.Certificate(
+                    json.loads(service_account_json)
+                )
+            elif service_account_b64:
+                credential = firebase_credentials.Certificate(
+                    json.loads(base64.b64decode(service_account_b64).decode("utf-8"))
+                )
+            options = {}
+            project_id = (os.getenv("FIREBASE_PROJECT_ID") or "").strip()
+            if project_id:
+                options["projectId"] = project_id
+            if credential is not None:
+                initialized = firebase_admin.initialize_app(credential, options or None)
+            else:
+                # Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS
+                # or the hosting platform's default service account).
+                initialized = firebase_admin.initialize_app(None, options or None)
+            # ADC credentials resolve LAZILY: initialize_app() succeeds even
+            # when no credentials exist anywhere. Force resolution now so a
+            # missing service account fails loudly here (auth DISABLED, so
+            # protected endpoints answer 503) instead of surfacing later as
+            # a misleading 401 on every token verification.
+            initialized.credential.get_credential()
+        FIREBASE_AUTH_ENABLED = True
+        print("[Auth] Firebase Admin initialized; backend auth is ENABLED.")
+    except Exception as error:
+        print(f"[Auth] Firebase Admin init failed ({error}); backend auth is DISABLED.")
+        FIREBASE_AUTH_ENABLED = False
+
+
+_init_firebase_admin()
+
+
+def _auth_error_response(message, status):
+    return jsonify({"success": False, "error": message}), status
+
+
+def require_auth(route):
+    """Require a valid Firebase ID token: Authorization: Bearer <token>.
+
+    Missing/invalid token -> 401. Auth not configured on the server -> 503
+    (fail closed, never serve AI endpoints unauthenticated). On success the
+    verified Firebase uid is stored on flask.g as g.firebase_uid.
+    """
+    @wraps(route)
+    def wrapper(*args, **kwargs):
+        if not FIREBASE_AUTH_ENABLED:
+            return _auth_error_response(
+                "Authentication is not configured on the server. "
+                "Set FIREBASE_SERVICE_ACCOUNT in the hosting environment.",
+                503,
+            )
+        header = request.headers.get("Authorization") or ""
+        token = header[7:].strip() if header.startswith("Bearer ") else ""
+        if not token:
+            return _auth_error_response(
+                "Missing Firebase ID token. Send Authorization: Bearer <idToken>.",
+                401,
+            )
+        try:
+            decoded = firebase_auth.verify_id_token(token)
+        except Exception as error:
+            # A credential/project misconfiguration must read as a server
+            # problem (503), never as "your token is bad" (401).
+            if (
+                type(error).__name__ == "DefaultCredentialsError"
+                or "project id is required" in str(error).lower()
+            ):
+                print(f"[Auth] Firebase misconfigured: {error}")
+                return _auth_error_response(
+                    "Authentication is not configured on the server. "
+                    "Set FIREBASE_SERVICE_ACCOUNT in the hosting environment.",
+                    503,
+                )
+            print(f"[Auth] Token verification failed: {error}")
+            return _auth_error_response(
+                "Invalid or expired Firebase ID token.", 401
+            )
+        uid = (decoded or {}).get("uid")
+        if not uid:
+            return _auth_error_response("Invalid Firebase ID token.", 401)
+        g.firebase_uid = uid
+        return route(*args, **kwargs)
+    return wrapper
+
+
+# ============================================================
+# PER-USER QUOTAS + RATE LIMITS (in-memory — see note below)
+# ============================================================
+# NOTE: usage is stored in process memory only. It resets on cold start /
+# redeploy and is per-instance on Vercel, so a burst spread across many
+# serverless instances can exceed these numbers. That is acceptable for
+# Phase 1: it stops casual abuse and single-user key-burning. A durable
+# store (Firestore/Redis) is the Phase 2 upgrade if abuse becomes real.
+#
+# Limits (overridable by env var):
+#   QUOTA_GENERATION_PER_DAY              50 AI calls/day/user (material,
+#                                         generate, flashcards, test-concepts,
+#                                         chat, oral-exam, generate-pdf)
+#   QUOTA_TRANSCRIPTION_MINUTES_PER_DAY   30 audio minutes/day/user
+#   RATE_LIMIT_REQUESTS_PER_MINUTE        120 requests/minute per client IP
+#                                         (all /api/* except /api/test)
+#   FEEDBACK_PER_HOUR                     10 feedback messages/hour/user
+
+QUOTA_GENERATION_PER_DAY = int(os.getenv("QUOTA_GENERATION_PER_DAY", "50"))
+QUOTA_TRANSCRIPTION_MINUTES_PER_DAY = float(
+    os.getenv("QUOTA_TRANSCRIPTION_MINUTES_PER_DAY", "30")
+)
+RATE_LIMIT_REQUESTS_PER_MINUTE = int(
+    os.getenv("RATE_LIMIT_REQUESTS_PER_MINUTE", "120")
+)
+FEEDBACK_PER_HOUR = int(os.getenv("FEEDBACK_PER_HOUR", "10"))
+
+_MAX_TRACKED_USERS = 10000
+_MAX_TRACKED_IPS = 10000
+
+_usage_lock = threading.Lock()
+# uid -> {"date": "YYYY-MM-DD", "generation": int,
+#         "transcription_minutes": float, "feedback": {hour: count}}
+_daily_usage = {}
+# client ip -> deque of monotonic timestamps (last 60s)
+_ip_requests = {}
+
+
+def _seconds_until_midnight_utc():
+    now = datetime.now(timezone.utc)
+    midnight = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return max(1, int((midnight - now).total_seconds()))
+
+
+def _usage_for(uid):
+    """Return today's usage entry for uid, resetting it on a new UTC day.
+
+    Callers must hold _usage_lock.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    entry = _daily_usage.get(uid)
+    if entry is None or entry.get("date") != today:
+        entry = {
+            "date": today,
+            "generation": 0,
+            "transcription_minutes": 0.0,
+            "feedback": {},
+        }
+        _daily_usage[uid] = entry
+        if len(_daily_usage) > _MAX_TRACKED_USERS:
+            _daily_usage.pop(next(iter(_daily_usage)))
+    return entry
+
+
+def _quota_exceeded_response(message, retry_after_seconds):
+    response = jsonify({
+        "success": False,
+        "error": message,
+        "retry_after_seconds": retry_after_seconds,
+    })
+    response.headers["Retry-After"] = str(retry_after_seconds)
+    return response, 429
+
+
+def _response_status(response):
+    if isinstance(response, tuple):
+        if len(response) > 1 and isinstance(response[1], int):
+            return response[1]
+        return 200
+    return getattr(response, "status_code", 200)
+
+
+def _generation_quota_error(uid):
+    with _usage_lock:
+        used = _usage_for(uid)["generation"]
+    if used >= QUOTA_GENERATION_PER_DAY:
+        return _quota_exceeded_response(
+            "Daily AI generation limit reached "
+            f"({QUOTA_GENERATION_PER_DAY} calls/day). Try again tomorrow.",
+            _seconds_until_midnight_utc(),
+        )
+    return None
+
+
+def enforce_generation_quota(route):
+    """Count one AI generation call per successful (2xx) POST.
+
+    The check runs before any provider call so a user over quota never
+    spends API keys. Failed calls (4xx/5xx) do not consume quota.
+    GET requests (e.g. the /api/chat deployment diagnostic) are not counted.
+    """
+    @wraps(route)
+    def wrapper(*args, **kwargs):
+        if request.method != "POST":
+            return route(*args, **kwargs)
+        error = _generation_quota_error(g.firebase_uid)
+        if error is not None:
+            return error
+        response = route(*args, **kwargs)
+        if 200 <= _response_status(response) < 300:
+            with _usage_lock:
+                _usage_for(g.firebase_uid)["generation"] += 1
+        return response
+    return wrapper
+
+
+def enforce_feedback_limit(route):
+    """Light per-user limit for /api/feedback: FEEDBACK_PER_HOUR per hour."""
+    @wraps(route)
+    def wrapper(*args, **kwargs):
+        if request.method != "POST":
+            return route(*args, **kwargs)
+        uid = g.firebase_uid
+        hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+        error = None
+        with _usage_lock:
+            used = _usage_for(uid)["feedback"].get(hour, 0)
+            if used >= FEEDBACK_PER_HOUR:
+                error = _quota_exceeded_response(
+                    "Feedback limit reached "
+                    f"({FEEDBACK_PER_HOUR} messages/hour). Try again later.",
+                    3600,
+                )
+        if error is not None:
+            return error
+        response = route(*args, **kwargs)
+        if 200 <= _response_status(response) < 300:
+            with _usage_lock:
+                entry = _usage_for(uid)
+                entry["feedback"][hour] = entry["feedback"].get(hour, 0) + 1
+        return response
+    return wrapper
+
+
+def estimate_audio_minutes(file_bytes, extension):
+    """Best-effort audio length in minutes.
+
+    WAV is exact (stdlib wave header). Other formats are estimated from
+    file size at ~160 kbps average bitrate — an approximation, documented
+    as such, that keeps the quota enforceable without an audio parser.
+    """
+    if extension == "wav":
+        try:
+            with wave.open(io.BytesIO(file_bytes), "rb") as wav_file:
+                rate = wav_file.getframerate()
+                if rate > 0:
+                    return round(wav_file.getnframes() / rate / 60.0, 2)
+        except Exception:
+            pass
+    return round(len(file_bytes) * 8 / 160000 / 60.0, 2)
+
+
+def check_transcription_quota(uid, audio_minutes):
+    """Return a 429 response if this audio would exceed the daily quota."""
+    with _usage_lock:
+        used = _usage_for(uid)["transcription_minutes"]
+    if used + audio_minutes > QUOTA_TRANSCRIPTION_MINUTES_PER_DAY:
+        return _quota_exceeded_response(
+            "Daily transcription limit reached "
+            f"({QUOTA_TRANSCRIPTION_MINUTES_PER_DAY} audio minutes/day; "
+            f"{used:.1f} used). Try again tomorrow.",
+            _seconds_until_midnight_utc(),
+        )
+    return None
+
+
+def record_transcription_usage(uid, audio_minutes):
+    with _usage_lock:
+        _usage_for(uid)["transcription_minutes"] += audio_minutes
+
+
+def _client_ip():
+    forwarded = request.headers.get("X-Forwarded-For") or ""
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+# ============================================================
 # FLASK APP
 # ============================================================
 
@@ -249,6 +582,39 @@ def handle_cors_preflight():
     # Explicitly answer browser preflight requests.
     if request.method == "OPTIONS":
         return ("", 204)
+
+
+@app.before_request
+def enforce_global_rate_limit():
+    """Global per-IP rate limit: RATE_LIMIT_REQUESTS_PER_MINUTE per 60s.
+
+    Applies to all /api/* except /api/test (health check) and skips OPTIONS.
+    In-memory and per-instance on Vercel — see the quotas note above.
+    """
+    if request.method == "OPTIONS":
+        return None
+    if not request.path.startswith("/api/") or request.path == "/api/test":
+        return None
+    ip = _client_ip()
+    now = time.monotonic()
+    with _usage_lock:
+        timestamps = _ip_requests.get(ip)
+        if timestamps is None:
+            timestamps = deque()
+            _ip_requests[ip] = timestamps
+            if len(_ip_requests) > _MAX_TRACKED_IPS:
+                _ip_requests.pop(next(iter(_ip_requests)))
+        while timestamps and timestamps[0] <= now - 60.0:
+            timestamps.popleft()
+        if len(timestamps) >= RATE_LIMIT_REQUESTS_PER_MINUTE:
+            retry_after = max(1, int(timestamps[0] + 60 - now))
+            return _quota_exceeded_response(
+                "Too many requests "
+                f"({RATE_LIMIT_REQUESTS_PER_MINUTE}/minute). Slow down and try again.",
+                retry_after,
+            )
+        timestamps.append(now)
+    return None
 
 
 @app.after_request
@@ -1230,6 +1596,7 @@ def transcribe_with_openai(file_bytes, filename, mime_type, language_hint=None):
 
 
 @app.route("/api/transcribe", methods=["POST", "OPTIONS"])
+@require_auth
 def transcribe_lecture():
     """Transcribe speech, then reuse the existing text language detector."""
     if request.method == "OPTIONS":
@@ -1258,6 +1625,14 @@ def transcribe_lecture():
             }), 413
 
         mime_type = resolve_audio_mime(filename, uploaded_file.mimetype)
+
+        # Daily transcription quota (audio minutes). Checked before any
+        # provider call so an over-quota user never spends API keys.
+        audio_minutes = estimate_audio_minutes(file_bytes, extension)
+        quota_error = check_transcription_quota(g.firebase_uid, audio_minutes)
+        if quota_error is not None:
+            return quota_error
+
         transcript_text = ""
         provider = None
         errors = []
@@ -1349,6 +1724,9 @@ def transcribe_lecture():
         elif language == "unknown" and audio_language:
             language = audio_language
 
+        # Only successful transcriptions consume quota.
+        record_transcription_usage(g.firebase_uid, audio_minutes)
+
         return jsonify({
             "success": True,
             "filename": filename,
@@ -1372,11 +1750,13 @@ def transcribe_lecture():
 # ============================================================
 
 @app.route("/api/auth/status", methods=["GET", "OPTIONS"])
+@require_auth
 def auth_status():
     """
-    Authentication is handled by Firebase on the frontend.
-    This endpoint is intentionally diagnostic only; it does not
-    create or store passwords.
+    Authentication is handled by Firebase on the frontend, and the backend
+    verifies the Firebase ID token on every /api/* endpoint (except
+    /api/test). This endpoint is diagnostic only; it does not create or
+    store passwords. A 200 here proves the caller's token verifies.
     """
 
     if request.method == "OPTIONS":
@@ -1385,8 +1765,10 @@ def auth_status():
     return jsonify({
         "success": True,
         "authentication": "Firebase Authentication",
-        "backend_auth_required": False,
-        "message": "Login and signup are handled by Firebase on the frontend."
+        "backend_auth_required": True,
+        "uid": g.firebase_uid,
+        "message": "Login and signup are handled by Firebase on the frontend. "
+                   "Send the Firebase ID token as Authorization: Bearer <idToken>."
     })
 
 
@@ -1398,6 +1780,8 @@ def auth_status():
     "/api/material",
     methods=["POST"]
 )
+@require_auth
+@enforce_generation_quota
 def process_material():
 
     try:
@@ -1643,6 +2027,8 @@ def process_material():
     "/api/generate",
     methods=["POST"]
 )
+@require_auth
+@enforce_generation_quota
 def generate_result():
 
     try:
@@ -2062,6 +2448,8 @@ Follow the language instructions exactly.
     "/api/flashcards",
     methods=["POST"]
 )
+@require_auth
+@enforce_generation_quota
 def generate_flashcards():
     """
     Generate concise front/back flashcards from the currently
@@ -2280,6 +2668,8 @@ Return ONLY the JSON array requested above.
     "/api/test-concepts",
     methods=["POST"]
 )
+@require_auth
+@enforce_generation_quota
 def generate_test_concepts():
     """
     Generate a timed 30-question MCQ exam from the current study material.
@@ -2551,6 +2941,8 @@ Return ONLY the requested JSON array.
     methods=["GET", "POST", "OPTIONS"],
     strict_slashes=False
 )
+@require_auth
+@enforce_generation_quota
 def chat_with_material():
 
     # GET is intentionally supported as a deployment diagnostic.
@@ -2908,6 +3300,8 @@ the study material above.
     "/api/generate-pdf",
     methods=["POST"]
 )
+@require_auth
+@enforce_generation_quota
 def generate_pdf_file():
 
     try:
@@ -3016,6 +3410,8 @@ def generate_pdf_file():
 # AI ORAL EXAM
 # ============================================================
 @app.route("/api/oral-exam", methods=["POST"])
+@require_auth
+@enforce_generation_quota
 def oral_exam():
     """Voice-only oral exam. The hidden reference answer stays server-side."""
     import json
@@ -3247,6 +3643,8 @@ Generate ONE short oral question from the study material, different from the pre
 # ============================================================
 
 @app.route("/api/feedback", methods=["POST", "OPTIONS"])
+@require_auth
+@enforce_feedback_limit
 def submit_feedback():
     if request.method == "OPTIONS":
         return ("", 204)

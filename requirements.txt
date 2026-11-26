@@ -11,3 +11,4 @@ langdetect
 arabic-reshaper
 python-bidi
 openai
+firebase-admin
