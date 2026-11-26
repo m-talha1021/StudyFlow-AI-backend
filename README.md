@@ -49,8 +49,8 @@ consume quota. Over-quota responses are `429` JSON with
 
 | Limit | Free | Pro |
 |---|---|---|
-| AI generation calls/day | 5 | 500 |
-| Transcription minutes/day | 20 | 300 |
+| AI generation calls/day | 5 | 150 |
+| Transcription minutes/day | 20 | 280 |
 | Feedback messages/hour | 10 | 10 |
 
 The plan is read from Firestore `users/{uid}` field `plan` (`"free"` or
@@ -95,8 +95,8 @@ keys or the service-account JSON.
 | `OPENAI_API_KEY` + `ENABLE_OPENAI_FALLBACK=true` | No | Paid OpenAI fallback, off by default. |
 | `FIREBASE_SERVICE_ACCOUNT` or `FIREBASE_SERVICE_ACCOUNT_BASE64` | Yes (prod) | Service-account JSON (raw or base64). Without it, protected endpoints answer 503. |
 | `FIREBASE_PROJECT_ID` | No | Override the Firebase project used to verify tokens. |
-| `QUOTA_GENERATION_PER_DAY` | No | Free-plan AI calls/day (default 5; Pro is fixed at 500/day). |
-| `QUOTA_TRANSCRIPTION_MINUTES_PER_DAY` | No | Free-plan audio minutes/day (default 20; Pro is fixed at 300/day). |
+| `QUOTA_GENERATION_PER_DAY` | No | Free-plan AI calls/day (default 5; Pro is fixed at 150/day). |
+| `QUOTA_TRANSCRIPTION_MINUTES_PER_DAY` | No | Free-plan audio minutes/day (default 20; Pro is fixed at 280/day). |
 | `RATE_LIMIT_REQUESTS_PER_MINUTE` | No | Global per-IP limit (default 120). |
 | `FEEDBACK_PER_HOUR` | No | Feedback messages/hour/user (default 10). |
 | `RESEND_API_KEY`, `FEEDBACK_TO_EMAIL`, `RESEND_FROM_EMAIL` | No | Feedback email; without them `/api/feedback` answers 503. |

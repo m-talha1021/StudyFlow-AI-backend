@@ -349,7 +349,7 @@ def require_auth(route):
 # PLANS (Phase 2): the user's plan is read from Firestore users/{uid}
 # `plan` ("free" or "pro"; missing/invalid -> "free"). The env vars above
 # are the FREE plan limits; Pro limits are fixed product constants
-# (500 AI calls and 300 transcription minutes/day). The feedback limit
+# (150 AI calls and 280 transcription minutes/day). The feedback limit
 # is the same for every plan.
 # If Firestore is unavailable the plan lookup fails safe to "free" —
 # never fail open to unlimited.
@@ -364,11 +364,11 @@ RATE_LIMIT_REQUESTS_PER_MINUTE = int(
 FEEDBACK_PER_HOUR = int(os.getenv("FEEDBACK_PER_HOUR", "10"))
 
 # Plan -> (generation calls/day, transcription minutes/day). The free
-# entry tracks the env-var limits above; Pro is fixed at 500/300 (the
+# entry tracks the env-var limits above; Pro is fixed at 150/280 (the
 # free limits no longer scale to Pro by a whole-number multiplier).
 _PLAN_LIMITS = {
     "free": (QUOTA_GENERATION_PER_DAY, QUOTA_TRANSCRIPTION_MINUTES_PER_DAY),
-    "pro": (500, 300),
+    "pro": (150, 280),
 }
 
 # Short-lived cache for plan lookups so one Firestore read does not happen
