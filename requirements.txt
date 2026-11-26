@@ -12,3 +12,4 @@ arabic-reshaper
 python-bidi
 openai
 firebase-admin
+stripe

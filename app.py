@@ -193,14 +193,31 @@ try:
     import firebase_admin
     from firebase_admin import auth as firebase_auth
     from firebase_admin import credentials as firebase_credentials
+    from firebase_admin import firestore as firebase_firestore
     _FIREBASE_ADMIN_IMPORTED = True
 except ImportError:
     firebase_admin = None
     firebase_auth = None
     firebase_credentials = None
+    firebase_firestore = None
     _FIREBASE_ADMIN_IMPORTED = False
 
+# Stripe is optional scaffolding (Phase 2): the checkout/webhook endpoints
+# fail closed with 503 until STRIPE_* env vars are set. A missing stripe
+# package must never crash the server, so the import is guarded like
+# firebase-admin above.
+try:
+    import stripe as stripe_lib
+    _STRIPE_IMPORTED = True
+except ImportError:
+    stripe_lib = None
+    _STRIPE_IMPORTED = False
+
 FIREBASE_AUTH_ENABLED = False
+# Firestore client for plan lookups (users/{uid} `plan`) and webhook
+# writes. None when Firebase Admin failed to initialize; plan lookups
+# then fail safe to "free" limits and never fail open to unlimited.
+_FIRESTORE_CLIENT = None
 
 
 def _init_firebase_admin():
@@ -210,6 +227,7 @@ def _init_firebase_admin():
     closed per request (503) so the misconfiguration is visible.
     """
     global FIREBASE_AUTH_ENABLED
+    global _FIRESTORE_CLIENT
     if not _FIREBASE_ADMIN_IMPORTED:
         print("[Auth] firebase-admin is not installed; backend auth is DISABLED.")
         return
@@ -244,6 +262,11 @@ def _init_firebase_admin():
             initialized.credential.get_credential()
         FIREBASE_AUTH_ENABLED = True
         print("[Auth] Firebase Admin initialized; backend auth is ENABLED.")
+        try:
+            _FIRESTORE_CLIENT = firebase_firestore.client()
+        except Exception as error:
+            _FIRESTORE_CLIENT = None
+            print(f"[Auth] Firestore client unavailable ({error}); plan lookups will use free limits.")
     except Exception as error:
         print(f"[Auth] Firebase Admin init failed ({error}); backend auth is DISABLED.")
         FIREBASE_AUTH_ENABLED = False
@@ -314,7 +337,7 @@ def require_auth(route):
 # Phase 1: it stops casual abuse and single-user key-burning. A durable
 # store (Firestore/Redis) is the Phase 2 upgrade if abuse becomes real.
 #
-# Limits (overridable by env var):
+# Limits (overridable by env var) — these are the FREE plan limits:
 #   QUOTA_GENERATION_PER_DAY              50 AI calls/day/user (material,
 #                                         generate, flashcards, test-concepts,
 #                                         chat, oral-exam, generate-pdf)
@@ -322,6 +345,12 @@ def require_auth(route):
 #   RATE_LIMIT_REQUESTS_PER_MINUTE        120 requests/minute per client IP
 #                                         (all /api/* except /api/test)
 #   FEEDBACK_PER_HOUR                     10 feedback messages/hour/user
+#
+# PLANS (Phase 2): the user's plan is read from Firestore users/{uid}
+# `plan` ("free" or "pro"; missing/invalid -> "free"). Pro limits are
+# 10x the free limits. The feedback limit is the same for every plan.
+# If Firestore is unavailable the plan lookup fails safe to "free" —
+# never fail open to unlimited.
 
 QUOTA_GENERATION_PER_DAY = int(os.getenv("QUOTA_GENERATION_PER_DAY", "50"))
 QUOTA_TRANSCRIPTION_MINUTES_PER_DAY = float(
@@ -331,6 +360,52 @@ RATE_LIMIT_REQUESTS_PER_MINUTE = int(
     os.getenv("RATE_LIMIT_REQUESTS_PER_MINUTE", "120")
 )
 FEEDBACK_PER_HOUR = int(os.getenv("FEEDBACK_PER_HOUR", "10"))
+
+# Plan -> quota multiplier applied to the free-plan limits above.
+_PLAN_QUOTA_MULTIPLIER = {"free": 1, "pro": 10}
+
+# Short-lived cache for plan lookups so one Firestore read does not happen
+# on every AI call. uid -> (plan, monotonic timestamp). A plan change
+# (e.g. via the Stripe webhook) takes at most _PLAN_CACHE_TTL_SECONDS
+# to be reflected in quota checks.
+_PLAN_CACHE_TTL_SECONDS = 60
+_plan_cache = {}
+
+
+def _plan_limits(plan):
+    """(generation calls/day, transcription minutes/day) for a plan."""
+    multiplier = _PLAN_QUOTA_MULTIPLIER.get(plan, 1)
+    return (
+        QUOTA_GENERATION_PER_DAY * multiplier,
+        QUOTA_TRANSCRIPTION_MINUTES_PER_DAY * multiplier,
+    )
+
+
+def _get_user_plan(uid):
+    """Read the user's plan from Firestore users/{uid} `plan`.
+
+    Returns "free" or "pro". Missing/invalid plan, a missing user doc, or
+    any Firestore failure all fail safe to "free" — never unlimited.
+    """
+    now = time.monotonic()
+    cached = _plan_cache.get(uid)
+    if cached is not None and now - cached[1] < _PLAN_CACHE_TTL_SECONDS:
+        return cached[0]
+    plan = "free"
+    try:
+        if FIREBASE_AUTH_ENABLED and _FIRESTORE_CLIENT is not None:
+            doc = _FIRESTORE_CLIENT.collection("users").document(uid).get()
+            if doc is not None and doc.exists:
+                raw = str((doc.to_dict() or {}).get("plan") or "").strip().lower()
+                if raw in _PLAN_QUOTA_MULTIPLIER:
+                    plan = raw
+    except Exception as error:
+        print(f"[Quotas] Plan lookup failed for user; using free limits ({error})")
+        plan = "free"
+    _plan_cache[uid] = (plan, now)
+    if len(_plan_cache) > _MAX_TRACKED_USERS:
+        _plan_cache.pop(next(iter(_plan_cache)))
+    return plan
 
 _MAX_TRACKED_USERS = 10000
 _MAX_TRACKED_IPS = 10000
@@ -371,12 +446,15 @@ def _usage_for(uid):
     return entry
 
 
-def _quota_exceeded_response(message, retry_after_seconds):
-    response = jsonify({
+def _quota_exceeded_response(message, retry_after_seconds, plan=None):
+    body = {
         "success": False,
         "error": message,
         "retry_after_seconds": retry_after_seconds,
-    })
+    }
+    if plan is not None:
+        body["plan"] = plan
+    response = jsonify(body)
     response.headers["Retry-After"] = str(retry_after_seconds)
     return response, 429
 
@@ -390,13 +468,16 @@ def _response_status(response):
 
 
 def _generation_quota_error(uid):
+    plan = _get_user_plan(uid)
+    limit, _ = _plan_limits(plan)
     with _usage_lock:
         used = _usage_for(uid)["generation"]
-    if used >= QUOTA_GENERATION_PER_DAY:
+    if used >= limit:
         return _quota_exceeded_response(
             "Daily AI generation limit reached "
-            f"({QUOTA_GENERATION_PER_DAY} calls/day). Try again tomorrow.",
+            f"for your {plan} plan ({limit} calls/day). Try again tomorrow.",
             _seconds_until_midnight_utc(),
+            plan=plan,
         )
     return None
 
@@ -471,14 +552,17 @@ def estimate_audio_minutes(file_bytes, extension):
 
 def check_transcription_quota(uid, audio_minutes):
     """Return a 429 response if this audio would exceed the daily quota."""
+    plan = _get_user_plan(uid)
+    _, limit = _plan_limits(plan)
     with _usage_lock:
         used = _usage_for(uid)["transcription_minutes"]
-    if used + audio_minutes > QUOTA_TRANSCRIPTION_MINUTES_PER_DAY:
+    if used + audio_minutes > limit:
         return _quota_exceeded_response(
             "Daily transcription limit reached "
-            f"({QUOTA_TRANSCRIPTION_MINUTES_PER_DAY} audio minutes/day; "
+            f"for your {plan} plan ({limit} audio minutes/day; "
             f"{used:.1f} used). Try again tomorrow.",
             _seconds_until_midnight_utc(),
+            plan=plan,
         )
     return None
 
@@ -1767,6 +1851,7 @@ def auth_status():
         "authentication": "Firebase Authentication",
         "backend_auth_required": True,
         "uid": g.firebase_uid,
+        "plan": _get_user_plan(g.firebase_uid),
         "message": "Login and signup are handled by Firebase on the frontend. "
                    "Send the Firebase ID token as Authorization: Bearer <idToken>."
     })
@@ -3712,6 +3797,198 @@ def submit_feedback():
     except Exception:
         app.logger.exception("Feedback email delivery failed before Resend confirmed acceptance.")
         return jsonify({"success": False, "error": "We could not reach the email service. Check the Vercel function logs and try again."}), 502
+
+
+# ============================================================
+# BILLING — STRIPE SCAFFOLDING (Phase 2, FREE-ONLY for now)
+# ============================================================
+# The product is free-only until the owner wires up a Stripe account.
+# These endpoints exist so payments can be switched on later WITHOUT a
+# code change: set STRIPE_SECRET_KEY, STRIPE_PRICE_PRO_MONTHLY and
+# STRIPE_WEBHOOK_SECRET in Vercel and the same code starts working.
+# Until then every call fails closed with 503 and NO Stripe call is made.
+# No key, price ID or webhook secret is ever hardcoded.
+#
+#   POST /api/billing/checkout   (auth required) creates a Stripe Checkout
+#                                session for the Pro monthly price.
+#   POST /api/billing/webhook    (no auth — Stripe calls it) verifies the
+#                                Stripe signature and sets users/{uid}
+#                                `plan` ("pro"/"free") + stripeCustomerId.
+
+_BILLING_NOT_CONFIGURED_MESSAGE = (
+    "Billing is not configured. Set STRIPE_SECRET_KEY, "
+    "STRIPE_PRICE_PRO_MONTHLY and STRIPE_WEBHOOK_SECRET in the hosting "
+    "environment to enable paid plans."
+)
+
+
+def _billing_not_configured_response():
+    return jsonify({"success": False, "error": _BILLING_NOT_CONFIGURED_MESSAGE}), 503
+
+
+def _set_user_plan(uid, plan, stripe_customer_id=None):
+    """Write the user's plan (and Stripe customer id) to Firestore.
+
+    Returns True on success, False when Firestore is unavailable or the
+    write fails. Never raises — callers decide how to respond.
+    """
+    if not FIREBASE_AUTH_ENABLED or _FIRESTORE_CLIENT is None:
+        print("[Billing] Firestore unavailable; cannot store plan for user.")
+        return False
+    try:
+        data = {"plan": plan}
+        if stripe_customer_id:
+            data["stripeCustomerId"] = stripe_customer_id
+        if firebase_firestore is not None:
+            data["planUpdatedAt"] = firebase_firestore.SERVER_TIMESTAMP
+        _FIRESTORE_CLIENT.collection("users").document(uid).set(data, merge=True)
+        # A plan change must be visible to quota checks immediately, not
+        # after the 60s plan cache expires.
+        _plan_cache.pop(uid, None)
+        return True
+    except Exception as error:
+        print(f"[Billing] Failed to store plan for user ({error})")
+        return False
+
+
+def _find_uid_by_stripe_customer(stripe_customer_id):
+    """Find a Firebase uid by its stored stripeCustomerId, or None."""
+    if not FIREBASE_AUTH_ENABLED or _FIRESTORE_CLIENT is None:
+        return None
+    try:
+        query = (
+            _FIRESTORE_CLIENT.collection("users")
+            .where("stripeCustomerId", "==", stripe_customer_id)
+            .limit(1)
+            .stream()
+        )
+        for doc in query:
+            return doc.id
+    except Exception as error:
+        print(f"[Billing] Stripe-customer lookup failed ({error})")
+    return None
+
+
+@app.route("/api/billing/checkout", methods=["POST", "OPTIONS"])
+@require_auth
+def create_billing_checkout():
+    """Create a Stripe Checkout session for the Pro monthly plan.
+
+    Only works when STRIPE_SECRET_KEY and STRIPE_PRICE_PRO_MONTHLY are
+    both set; otherwise 503 with no Stripe call. The frontend does not
+    call this while the product is free-only.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    secret_key = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
+    price_id = (os.getenv("STRIPE_PRICE_PRO_MONTHLY") or "").strip()
+    if not _STRIPE_IMPORTED or not secret_key or not price_id:
+        return _billing_not_configured_response()
+
+    data = request.get_json(silent=True) or {}
+    success_url = str(data.get("success_url") or "").strip()
+    cancel_url = str(data.get("cancel_url") or "").strip()
+    if not success_url:
+        success_url = "https://study-flow-ai-lac.vercel.app/dashboard?billing=success"
+    if not cancel_url:
+        cancel_url = "https://study-flow-ai-lac.vercel.app/dashboard?billing=cancelled"
+
+    try:
+        stripe_lib.api_key = secret_key
+        session = stripe_lib.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            client_reference_id=g.firebase_uid,
+            metadata={"firebase_uid": g.firebase_uid},
+            subscription_data={"metadata": {"firebase_uid": g.firebase_uid}},
+        )
+    except Exception as error:
+        app.logger.error("Stripe Checkout session creation failed: %s", error)
+        return jsonify({
+            "success": False,
+            "error": "Could not start checkout. Check the Vercel function logs and try again.",
+        }), 502
+    return jsonify({
+        "success": True,
+        "checkout_url": session.url,
+        "session_id": session.id,
+    }), 200
+
+
+@app.route("/api/billing/webhook", methods=["POST"])
+def stripe_webhook():
+    """Handle Stripe webhook events. Called by Stripe, not by users, so
+    this endpoint intentionally has NO Firebase auth — instead the
+    Stripe signature is verified with STRIPE_WEBHOOK_SECRET.
+
+    503 "billing is not configured" when the webhook secret is unset;
+    400 on a missing/bad signature. On checkout.session.completed /
+    customer.subscription.updated / customer.subscription.deleted the
+    user's plan is set to "pro" / "free" in Firestore.
+    """
+    webhook_secret = (os.getenv("STRIPE_WEBHOOK_SECRET") or "").strip()
+    if not _STRIPE_IMPORTED or not webhook_secret:
+        return _billing_not_configured_response()
+
+    payload = request.get_data(as_text=False)
+    signature = request.headers.get("Stripe-Signature") or ""
+    if not signature:
+        return jsonify({"success": False, "error": "Missing Stripe signature."}), 400
+    try:
+        event = stripe_lib.Webhook.construct_event(payload, signature, webhook_secret)
+    except ValueError:
+        return jsonify({"success": False, "error": "Invalid webhook payload."}), 400
+    except Exception as error:
+        # stripe.error.SignatureVerificationError (and any other
+        # verification failure) must read as a bad signature, not a
+        # server error — Stripe must not retry a forged event.
+        print(f"[Billing] Webhook signature verification failed ({error})")
+        return jsonify({"success": False, "error": "Invalid Stripe signature."}), 400
+
+    event_type = (event or {}).get("type") or ""
+    event_data = (event or {}).get("data") or {}
+    stripe_object = event_data.get("object") or {}
+    if not isinstance(stripe_object, dict):
+        return jsonify({"success": True, "received": True}), 200
+
+    uid = None
+    plan = None
+    stripe_customer_id = stripe_object.get("customer") or None
+
+    if event_type == "checkout.session.completed":
+        metadata = stripe_object.get("metadata") or {}
+        uid = metadata.get("firebase_uid") or stripe_object.get("client_reference_id")
+        plan = "pro"
+    elif event_type == "customer.subscription.updated":
+        metadata = stripe_object.get("metadata") or {}
+        uid = metadata.get("firebase_uid")
+        status = str(stripe_object.get("status") or "").lower()
+        plan = "pro" if status in {"active", "trialing"} else "free"
+    elif event_type == "customer.subscription.deleted":
+        metadata = stripe_object.get("metadata") or {}
+        uid = metadata.get("firebase_uid")
+        plan = "free"
+    else:
+        # Unhandled event type: acknowledge so Stripe does not retry.
+        return jsonify({"success": True, "received": True}), 200
+
+    if not uid and stripe_customer_id:
+        uid = _find_uid_by_stripe_customer(stripe_customer_id)
+    if not uid:
+        print(f"[Billing] Webhook {event_type}: no Firebase uid found; ignoring.")
+        return jsonify({"success": True, "received": True}), 200
+
+    if not _set_user_plan(uid, plan, stripe_customer_id):
+        # Stripe retries on non-2xx, so a failed Firestore write must
+        # not be acknowledged — the plan update will be retried.
+        return jsonify({
+            "success": False,
+            "error": "Could not store the plan update. Stripe will retry.",
+        }), 500
+    return jsonify({"success": True, "received": True}), 200
 
 
 # ============================================================
