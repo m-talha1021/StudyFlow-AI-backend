@@ -338,35 +338,38 @@ def require_auth(route):
 # store (Firestore/Redis) is the Phase 2 upgrade if abuse becomes real.
 #
 # Limits (overridable by env var) — these are the FREE plan limits:
-#   QUOTA_GENERATION_PER_DAY              25 AI calls/day/user (material,
+#   QUOTA_GENERATION_PER_DAY              10 AI calls/day/user (material,
 #                                         generate, flashcards, test-concepts,
 #                                         chat, oral-exam, generate-pdf)
-#   QUOTA_TRANSCRIPTION_MINUTES_PER_DAY   30 audio minutes/day/user
+#   QUOTA_TRANSCRIPTION_MINUTES_PER_DAY   20 audio minutes/day/user
 #   RATE_LIMIT_REQUESTS_PER_MINUTE        120 requests/minute per client IP
 #                                         (all /api/* except /api/test)
 #   FEEDBACK_PER_HOUR                     10 feedback messages/hour/user
 #
 # PLANS (Phase 2): the user's plan is read from Firestore users/{uid}
-# `plan` ("free" or "pro"; missing/invalid -> "free"). Pro generation is
-# 20x the free limit (500 calls/day) and Pro transcription is 10x the
-# free limit (300 minutes/day). The feedback limit is the same for every plan.
+# `plan` ("free" or "pro"; missing/invalid -> "free"). The env vars above
+# are the FREE plan limits; Pro limits are fixed product constants
+# (500 AI calls and 300 transcription minutes/day). The feedback limit
+# is the same for every plan.
 # If Firestore is unavailable the plan lookup fails safe to "free" —
 # never fail open to unlimited.
 
-QUOTA_GENERATION_PER_DAY = int(os.getenv("QUOTA_GENERATION_PER_DAY", "25"))
+QUOTA_GENERATION_PER_DAY = int(os.getenv("QUOTA_GENERATION_PER_DAY", "10"))
 QUOTA_TRANSCRIPTION_MINUTES_PER_DAY = float(
-    os.getenv("QUOTA_TRANSCRIPTION_MINUTES_PER_DAY", "30")
+    os.getenv("QUOTA_TRANSCRIPTION_MINUTES_PER_DAY", "20")
 )
 RATE_LIMIT_REQUESTS_PER_MINUTE = int(
     os.getenv("RATE_LIMIT_REQUESTS_PER_MINUTE", "120")
 )
 FEEDBACK_PER_HOUR = int(os.getenv("FEEDBACK_PER_HOUR", "10"))
 
-# Plan -> quota multiplier applied to the free-plan limits above.
-# Generation and transcription scale differently: Pro gets 20x the free
-# generation calls (25 -> 500) and 10x the transcription minutes (30 -> 300).
-_PLAN_QUOTA_MULTIPLIER = {"free": 1, "pro": 10}
-_PLAN_GENERATION_MULTIPLIER = {"free": 1, "pro": 20}
+# Plan -> (generation calls/day, transcription minutes/day). The free
+# entry tracks the env-var limits above; Pro is fixed at 500/300 (the
+# free limits no longer scale to Pro by a whole-number multiplier).
+_PLAN_LIMITS = {
+    "free": (QUOTA_GENERATION_PER_DAY, QUOTA_TRANSCRIPTION_MINUTES_PER_DAY),
+    "pro": (500, 300),
+}
 
 # Short-lived cache for plan lookups so one Firestore read does not happen
 # on every AI call. uid -> (plan, monotonic timestamp). A plan change
@@ -378,10 +381,7 @@ _plan_cache = {}
 
 def _plan_limits(plan):
     """(generation calls/day, transcription minutes/day) for a plan."""
-    return (
-        QUOTA_GENERATION_PER_DAY * _PLAN_GENERATION_MULTIPLIER.get(plan, 1),
-        QUOTA_TRANSCRIPTION_MINUTES_PER_DAY * _PLAN_QUOTA_MULTIPLIER.get(plan, 1),
-    )
+    return _PLAN_LIMITS.get(plan, _PLAN_LIMITS["free"])
 
 
 def _get_user_plan(uid):
@@ -400,7 +400,7 @@ def _get_user_plan(uid):
             doc = _FIRESTORE_CLIENT.collection("users").document(uid).get()
             if doc is not None and doc.exists:
                 raw = str((doc.to_dict() or {}).get("plan") or "").strip().lower()
-                if raw in _PLAN_QUOTA_MULTIPLIER:
+                if raw in _PLAN_LIMITS:
                     plan = raw
     except Exception as error:
         print(f"[Quotas] Plan lookup failed for user; using free limits ({error})")
