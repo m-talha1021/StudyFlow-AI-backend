@@ -1,1 +1,1 @@
-{"$schema":"https://openapi.vercel.sh/vercel.json","rewrites":[{"destination":"/app.py","source":"/(.*)"}]}
+{"$schema":"https://openapi.vercel.sh/vercel.json"}
