@@ -49,7 +49,7 @@ consume quota. Over-quota responses are `429` JSON with
 
 | Limit | Free | Pro |
 |---|---|---|
-| AI generation calls/day | 50 | 500 |
+| AI generation calls/day | 25 | 500 |
 | Transcription minutes/day | 30 | 300 |
 | Feedback messages/hour | 10 | 10 |
 
@@ -95,7 +95,7 @@ keys or the service-account JSON.
 | `OPENAI_API_KEY` + `ENABLE_OPENAI_FALLBACK=true` | No | Paid OpenAI fallback, off by default. |
 | `FIREBASE_SERVICE_ACCOUNT` or `FIREBASE_SERVICE_ACCOUNT_BASE64` | Yes (prod) | Service-account JSON (raw or base64). Without it, protected endpoints answer 503. |
 | `FIREBASE_PROJECT_ID` | No | Override the Firebase project used to verify tokens. |
-| `QUOTA_GENERATION_PER_DAY` | No | Free-plan AI calls/day (default 50; Pro is 10x). |
+| `QUOTA_GENERATION_PER_DAY` | No | Free-plan AI calls/day (default 25; Pro is 20x, 500/day). |
 | `QUOTA_TRANSCRIPTION_MINUTES_PER_DAY` | No | Free-plan audio minutes/day (default 30; Pro is 10x). |
 | `RATE_LIMIT_REQUESTS_PER_MINUTE` | No | Global per-IP limit (default 120). |
 | `FEEDBACK_PER_HOUR` | No | Feedback messages/hour/user (default 10). |

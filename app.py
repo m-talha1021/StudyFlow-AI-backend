@@ -338,7 +338,7 @@ def require_auth(route):
 # store (Firestore/Redis) is the Phase 2 upgrade if abuse becomes real.
 #
 # Limits (overridable by env var) — these are the FREE plan limits:
-#   QUOTA_GENERATION_PER_DAY              50 AI calls/day/user (material,
+#   QUOTA_GENERATION_PER_DAY              25 AI calls/day/user (material,
 #                                         generate, flashcards, test-concepts,
 #                                         chat, oral-exam, generate-pdf)
 #   QUOTA_TRANSCRIPTION_MINUTES_PER_DAY   30 audio minutes/day/user
@@ -347,12 +347,13 @@ def require_auth(route):
 #   FEEDBACK_PER_HOUR                     10 feedback messages/hour/user
 #
 # PLANS (Phase 2): the user's plan is read from Firestore users/{uid}
-# `plan` ("free" or "pro"; missing/invalid -> "free"). Pro limits are
-# 10x the free limits. The feedback limit is the same for every plan.
+# `plan` ("free" or "pro"; missing/invalid -> "free"). Pro generation is
+# 20x the free limit (500 calls/day) and Pro transcription is 10x the
+# free limit (300 minutes/day). The feedback limit is the same for every plan.
 # If Firestore is unavailable the plan lookup fails safe to "free" —
 # never fail open to unlimited.
 
-QUOTA_GENERATION_PER_DAY = int(os.getenv("QUOTA_GENERATION_PER_DAY", "50"))
+QUOTA_GENERATION_PER_DAY = int(os.getenv("QUOTA_GENERATION_PER_DAY", "25"))
 QUOTA_TRANSCRIPTION_MINUTES_PER_DAY = float(
     os.getenv("QUOTA_TRANSCRIPTION_MINUTES_PER_DAY", "30")
 )
@@ -362,7 +363,10 @@ RATE_LIMIT_REQUESTS_PER_MINUTE = int(
 FEEDBACK_PER_HOUR = int(os.getenv("FEEDBACK_PER_HOUR", "10"))
 
 # Plan -> quota multiplier applied to the free-plan limits above.
+# Generation and transcription scale differently: Pro gets 20x the free
+# generation calls (25 -> 500) and 10x the transcription minutes (30 -> 300).
 _PLAN_QUOTA_MULTIPLIER = {"free": 1, "pro": 10}
+_PLAN_GENERATION_MULTIPLIER = {"free": 1, "pro": 20}
 
 # Short-lived cache for plan lookups so one Firestore read does not happen
 # on every AI call. uid -> (plan, monotonic timestamp). A plan change
@@ -374,10 +378,9 @@ _plan_cache = {}
 
 def _plan_limits(plan):
     """(generation calls/day, transcription minutes/day) for a plan."""
-    multiplier = _PLAN_QUOTA_MULTIPLIER.get(plan, 1)
     return (
-        QUOTA_GENERATION_PER_DAY * multiplier,
-        QUOTA_TRANSCRIPTION_MINUTES_PER_DAY * multiplier,
+        QUOTA_GENERATION_PER_DAY * _PLAN_GENERATION_MULTIPLIER.get(plan, 1),
+        QUOTA_TRANSCRIPTION_MINUTES_PER_DAY * _PLAN_QUOTA_MULTIPLIER.get(plan, 1),
     )
 
 
