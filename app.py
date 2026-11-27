@@ -2108,6 +2108,34 @@ def process_material():
 
 
 # ============================================================
+# QUIZ QUESTION COUNTS
+# ============================================================
+
+def parse_quiz_counts(data):
+    """Parse and clamp quiz question counts from a request body.
+
+    Defaults preserve the previous fixed prompt (10 MCQs, 5 short
+    questions). Caps protect token usage and keep the request
+    predictable: MCQs 1-20, short-answer questions 0-10.
+    Non-numeric or missing values fall back to the defaults.
+    """
+
+    try:
+        mcq_count = int(data.get("mcq_count", 10))
+    except (TypeError, ValueError):
+        mcq_count = 10
+    mcq_count = max(1, min(mcq_count, 20))
+
+    try:
+        short_count = int(data.get("short_count", 5))
+    except (TypeError, ValueError):
+        short_count = 5
+    short_count = max(0, min(short_count, 10))
+
+    return mcq_count, short_count
+
+
+# ============================================================
 # GENERATE STUDY RESULT
 # ============================================================
 
@@ -2159,6 +2187,32 @@ def generate_result():
                 "error":
                     "Invalid generation mode."
             }), 400
+
+
+        # ====================================================
+        # QUIZ QUESTION COUNTS
+        # ====================================================
+
+        # Only quiz mode uses counts. The frontend asks the user
+        # for them before generating; the defaults (10 MCQs, 5
+        # short questions) match the previous fixed prompt.
+        mcq_count = None
+        short_count = None
+        short_requirement = None
+
+        if mode == "quiz":
+            mcq_count, short_count = parse_quiz_counts(data)
+
+            if short_count > 0:
+                short_requirement = (
+                    f"- Create exactly {short_count} "
+                    "short-answer questions."
+                )
+            else:
+                short_requirement = (
+                    "- Do not create any short-answer "
+                    "questions."
+                )
 
 
         material = resolve_request_material(data)
@@ -2413,10 +2467,10 @@ Create a quiz from the provided study material.
 
 Requirements:
 
-- Create 8 to 10 multiple-choice questions.
+- Create exactly {mcq_count} multiple-choice questions.
 - Every MCQ must have exactly four options:
   A, B, C and D.
-- Create 4 to 5 short-answer questions.
+{short_requirement}
 - Questions must be based ONLY on the provided context.
 - Do NOT provide an answer key.
 - Do NOT mark the correct option.
