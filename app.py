@@ -65,9 +65,33 @@ if not GEMINI_API_KEY:
 # GEMINI CLIENT
 # ============================================================
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+# The Gemini call previously had NO timeout at all: HttpOptions.timeout
+# defaults to None, and the SDK passes timeout=None to httpx, which
+# disables the timeout entirely. Combined with the SDK's automatic
+# retries (up to 5 attempts with exponential backoff on 429/5xx), a
+# rate-limited or slow Gemini call could block for a minute or more
+# before the chain ever reached Groq -- and a 10-MCQ + 5-short quiz is
+# a long output, so slow first-provider calls were the whole wait.
+# Bound it: fail fast to Groq (18s timeout) instead of waiting.
+# Env-overridable: GEMINI_TIMEOUT_MS (default 45000), GEMINI_RETRY_ATTEMPTS
+# (default 2 = initial attempt + 1 retry). 45s still leaves room for a
+# legitimately slow long generation and for audio transcription of a
+# 55s chunk; the fallback keeps the app booting on older SDKs.
+def _build_gemini_client():
+    try:
+        http_options = types.HttpOptions(
+            timeout=int(os.getenv("GEMINI_TIMEOUT_MS", "45000")),
+            retry_options=types.HttpRetryOptions(
+                attempts=int(os.getenv("GEMINI_RETRY_ATTEMPTS", "2")),
+            ),
+        )
+        return genai.Client(api_key=GEMINI_API_KEY, http_options=http_options)
+    except Exception as error:
+        print(f"[Providers] Gemini HttpOptions unsupported ({error}); using default client options.")
+        return genai.Client(api_key=GEMINI_API_KEY)
+
+
+client = _build_gemini_client()
 
 
 # ============================================================
