@@ -65,7 +65,7 @@ def extract_image_text(
     # ------------------------------------------------
 
     prompt = """
-You are processing an image for StudyFlow AI.
+You are processing an image for StudyQue.
 
 Extract the study-related information contained
 in this image.

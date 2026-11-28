@@ -1,6 +1,6 @@
-# StudyFlow AI — Backend
+# StudyQue — Backend
 
-Flask API behind [StudyFlow AI](https://study-flow-ai-lac.vercel.app): turn
+Flask API behind [StudyQue](https://study-flow-ai-lac.vercel.app): turn
 lecture audio and study material into transcripts, summaries, explanations,
 quizzes, flashcards, tests, oral exams, AI chat over your material, and PDF
 exports.

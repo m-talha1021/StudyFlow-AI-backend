@@ -118,7 +118,7 @@ if OPENROUTER_API_KEY:
         max_retries=0,
         default_headers={
             "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://study-flow-ai-lac.vercel.app"),
-            "X-Title": os.getenv("OPENROUTER_APP_NAME", "StudyFlowAI"),
+            "X-Title": os.getenv("OPENROUTER_APP_NAME", "StudyQue"),
         },
     )
 
@@ -1160,7 +1160,7 @@ def home():
     return jsonify({
         "success": True,
         "message":
-            "StudyFlow AI backend is running!"
+            "StudyQue backend is running!"
     })
 
 
@@ -1174,7 +1174,7 @@ def test_api():
     return jsonify({
         "success": True,
         "message":
-            "Hello from the StudyFlow AI backend!"
+            "Hello from the StudyQue backend!"
     })
 
 
@@ -2429,7 +2429,7 @@ The source language has priority.
         if mode == "summary":
 
             instructions = f"""
-You are StudyFlow AI, an AI study assistant.
+You are StudyQue, an AI study assistant.
 
 Create a clear and useful summary of the provided
 study material.
@@ -2456,7 +2456,7 @@ Requirements:
         elif mode == "explain":
 
             instructions = f"""
-You are StudyFlow AI, an AI study assistant.
+You are StudyQue, an AI study assistant.
 
 Explain the provided study material in a way that
 a student can easily understand.
@@ -2483,7 +2483,7 @@ Requirements:
         else:
 
             instructions = f"""
-You are StudyFlow AI, an AI study assistant.
+You are StudyQue, an AI study assistant.
 
 Create a quiz from the provided study material.
 
@@ -2691,7 +2691,7 @@ Do not unnecessarily translate the source.
             }), 500
 
         instructions = f"""
-You are StudyFlow AI, an AI study assistant.
+You are StudyQue, an AI study assistant.
 
 Create exactly {count} flashcards from the provided study
 material.
@@ -3038,7 +3038,7 @@ Do not unnecessarily translate the source.
             }), 500
 
         instructions = f"""
-You are StudyFlow AI, an AI study assistant.
+You are StudyQue, an AI study assistant.
 
 Create a mind map (concept tree) from the provided study
 material.
@@ -3220,7 +3220,7 @@ def generate_test_concepts():
             }), 500
 
         instructions = f"""
-You are StudyFlow AI's exam generator.
+You are StudyQue's exam generator.
 
 Create exactly {count} high-quality multiple-choice questions from ONLY
 THE PROVIDED STUDY MATERIAL.
@@ -3446,7 +3446,7 @@ def chat_with_material():
     if request.method == "GET":
         return jsonify({
             "success": True,
-            "message": "StudyFlow AI chatbot endpoint is running.",
+            "message": "StudyQue chatbot endpoint is running.",
             "endpoint": "/api/chat",
             "method": "POST"
         })
@@ -3631,7 +3631,7 @@ Use the dominant language of the study material.
             elif role == "assistant":
 
                 history_text += (
-                    f"StudyFlow AI: {content}\n"
+                    f"StudyQue: {content}\n"
                 )
 
 
@@ -3640,7 +3640,7 @@ Use the dominant language of the study material.
         # ====================================================
 
         instructions = f"""
-You are StudyFlow AI, an AI study assistant.
+You are StudyQue, an AI study assistant.
 
 The student is asking a question about their
 uploaded study material.
@@ -3845,19 +3845,19 @@ def generate_pdf_file():
         titles = {
 
             "summary":
-                "StudyFlow AI - Summary",
+                "StudyQue - Summary",
 
             "explain":
-                "StudyFlow AI - Explanation",
+                "StudyQue - Explanation",
 
             "quiz":
-                "StudyFlow AI - Quiz"
+                "StudyQue - Quiz"
         }
 
 
         title = titles.get(
             mode,
-            "StudyFlow AI"
+            "StudyQue"
         )
 
 
@@ -3876,7 +3876,7 @@ def generate_pdf_file():
             as_attachment=True,
 
             download_name=(
-                f"studyflow_{mode}.pdf"
+                f"studyque_{mode}.pdf"
             )
         )
 
@@ -3974,7 +3974,7 @@ def oral_exam():
                 "Find important concepts, definitions, facts, processes, and "
                 "exam-relevant ideas for short oral questions."
             )
-            instructions = f"""You are StudyFlow AI conducting a short oral exam.
+            instructions = f"""You are StudyQue conducting a short oral exam.
 {language_rule}
 Create ONE short, clear oral question from the provided study material. Use ONLY the material. Do not use outside knowledge. Return ONLY JSON: {{"question":"short question","reference_answer":"short correct answer"}}"""
 
@@ -4084,7 +4084,7 @@ Use ONLY the study material. Compare the student's answer with the reference ans
             "Find another important concept or fact for a short oral question. "
             f"Avoid repeating this question: {session['question']}"
         )
-        next_instructions = f"""You are StudyFlow AI conducting an oral exam.
+        next_instructions = f"""You are StudyQue conducting an oral exam.
 {language_rule}
 Generate ONE short oral question from the study material, different from the previous question. Use ONLY the material. Return ONLY JSON: {{"question":"short question","reference_answer":"short correct answer"}}"""
         next_prompt = (
@@ -4147,7 +4147,7 @@ def submit_feedback():
     data = request.get_json(silent=True) or {}
     feedback_type = str(data.get("type", "General feedback")).strip()
     message = str(data.get("message", "")).strip()
-    sender_name = str(data.get("name", "StudyFlow AI user")).strip()[:120]
+    sender_name = str(data.get("name", "StudyQue user")).strip()[:120]
 
     if feedback_type not in {"Suggestion", "Bug report", "General feedback"}:
         feedback_type = "General feedback"
@@ -4156,7 +4156,7 @@ def submit_feedback():
 
     api_key = (os.getenv("RESEND_API_KEY") or "").strip()
     destination = (os.getenv("FEEDBACK_TO_EMAIL") or "").strip()
-    sender = (os.getenv("RESEND_FROM_EMAIL") or "StudyFlow AI <onboarding@resend.dev>").strip()
+    sender = (os.getenv("RESEND_FROM_EMAIL") or "StudyQue <onboarding@resend.dev>").strip()
 
     if not api_key or not destination or not sender:
         missing = [
@@ -4170,15 +4170,15 @@ def submit_feedback():
         return jsonify({"success": False, "error": "Feedback email service is not configured. Check the Vercel environment variables."}), 503
 
     email_text = (
-        "New feedback submitted through StudyFlow AI.\n\n"
+        "New feedback submitted through StudyQue.\n\n"
         f"Type: {feedback_type}\n"
-        f"Name: {sender_name or 'StudyFlow AI user'}\n\n"
+        f"Name: {sender_name or 'StudyQue user'}\n\n"
         f"Feedback:\n{message}\n"
     )
     payload = {
         "from": sender,
         "to": [destination],
-        "subject": f"StudyFlow AI feedback: {feedback_type}",
+        "subject": f"StudyQue feedback: {feedback_type}",
         "text": email_text,
     }
 
@@ -4188,7 +4188,7 @@ def submit_feedback():
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "StudyFlowAI"
+            "User-Agent": "StudyQue"
         },
         method="POST",
     )
